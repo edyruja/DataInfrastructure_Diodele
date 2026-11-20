@@ -14,7 +14,7 @@ import * as Location from 'expo-location';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
-const BASE_WS_URL = 'link worker not done yet';
+const BASE_WS_URL = 'wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws';
 
 export default function App() {
   const [driverName, setDriverName] = useState('Alex - S23');
