@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS laps (
   lap_number INTEGER,
   duration_ms INTEGER,
   max_speed_kmh REAL,
+  avg_speed_kmh REAL,
   max_g_lat REAL,
   max_g_brake REAL
 );
