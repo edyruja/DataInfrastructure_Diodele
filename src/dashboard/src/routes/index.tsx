@@ -600,6 +600,13 @@ function Index() {
     return telemetry;
   }, [referenceTrack, isCurrentSessionLive, liveTrackPoints, telemetry]);
 
+  const isClosedLoop = useMemo(() => {
+    if (activeTrackPoints.length < 15) return false;
+    const first = activeTrackPoints[0]!;
+    const last = activeTrackPoints[activeTrackPoints.length - 1]!;
+    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 35;
+  }, [activeTrackPoints]);
+
   // Track GPS waypoints: deduplicates consecutive stationary points for continuous 60 FPS trajectory
   const trackWaypoints = useMemo(() => {
     return extractGpsWaypoints(activeTrackPoints);
@@ -654,12 +661,6 @@ function Index() {
   }, [isReplaying, replayTrackPos, fullProjectedTrack, trackBounds]);
 
   const startPoint = smoothFullTrack.length > 0 ? smoothFullTrack[0] : null;
-  const isClosedLoop = useMemo(() => {
-    if (activeTrackPoints.length < 15) return false;
-    const first = activeTrackPoints[0]!;
-    const last = activeTrackPoints[activeTrackPoints.length - 1]!;
-    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 35;
-  }, [activeTrackPoints]);
 
   const endPoint =
     smoothFullTrack.length > 1 && !isClosedLoop
