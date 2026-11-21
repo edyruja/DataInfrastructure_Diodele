@@ -2,7 +2,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   device_id TEXT,
   track_name TEXT,
-  created_at TEXT
+  created_at TEXT,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS laps (

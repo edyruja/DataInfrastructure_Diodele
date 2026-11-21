@@ -11,6 +11,7 @@ import {
   interpolateTelemetryPoint,
   extractGpsWaypoints,
   interpolateTrackPosition,
+  interpolateTrackSpline,
 } from "@/lib/telemetry-sessions";
 
 describe("extractGpsWaypoints and interpolateTrackPosition (60 FPS smooth circuit movement)", () => {
@@ -278,5 +279,51 @@ describe("isLapValid and Best Lap Selection", () => {
     expect(projected[0]!.speed).toBe(55);
     expect(projected[1]!.g_lat).toBe(-0.62);
     expect(projected[1]!.g_lon).toBe(0.30);
+  });
+});
+
+describe("interpolateTrackSpline (smooth circuit curve interpolation)", () => {
+  const coarsePoints = [
+    { x: 50, y: 50, speed: 40, apex: 0 as const, g_lat: 0.1, g_lon: 0.2 },
+    { x: 100, y: 150, speed: 70, apex: 1 as const, g_lat: 0.9, g_lon: -0.5 },
+    { x: 200, y: 150, speed: 90, apex: 0 as const, g_lat: 0.2, g_lon: 0.4 },
+    { x: 250, y: 50, speed: 50, apex: 0 as const, g_lat: 0.0, g_lon: -0.2 },
+  ];
+
+  it("densifies coarse track points into a smooth curved spline trajectory", () => {
+    const smooth = interpolateTrackSpline(coarsePoints, false, 4);
+    expect(smooth.length).toBeGreaterThan(coarsePoints.length);
+
+    // First and last points should match original endpoints
+    expect(smooth[0]!.x).toBeCloseTo(50, 0);
+    expect(smooth[0]!.y).toBeCloseTo(50, 0);
+    expect(smooth[smooth.length - 1]!.x).toBeCloseTo(250, 0);
+    expect(smooth[smooth.length - 1]!.y).toBeCloseTo(50, 0);
+  });
+
+  it("smoothly interpolates speed and g-forces across intermediate spline points", () => {
+    const smooth = interpolateTrackSpline(coarsePoints, false, 4);
+    // Find an intermediate point between point 0 (speed 40) and point 1 (speed 70)
+    const midPoint = smooth.find((p) => p.x > 60 && p.x < 90);
+    expect(midPoint).toBeDefined();
+    expect(midPoint!.speed).toBeGreaterThan(40);
+    expect(midPoint!.speed).toBeLessThan(70);
+    expect(midPoint!.g_lat).toBeDefined();
+  });
+
+  it("handles closed loop track interpolation without seams", () => {
+    const closed = interpolateTrackSpline(coarsePoints, true, 4);
+    expect(closed.length).toBeGreaterThan(coarsePoints.length);
+    // In a closed loop, first and last point connect
+    const first = closed[0]!;
+    const last = closed[closed.length - 1]!;
+    expect(first.x).toBeCloseTo(last.x, 0);
+    expect(first.y).toBeCloseTo(last.y, 0);
+  });
+
+  it("handles boundary condition with minimal points gracefully", () => {
+    expect(interpolateTrackSpline([], false)).toEqual([]);
+    const single = [{ x: 10, y: 10, speed: 30, apex: 0 as const }];
+    expect(interpolateTrackSpline(single, false)).toEqual(single);
   });
 });

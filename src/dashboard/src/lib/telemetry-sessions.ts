@@ -22,6 +22,7 @@ export type ApiSession = {
   device_id: string;
   track_name: string;
   created_at: string;
+  updated_at?: string;
 };
 
 export type ApiLap = {
@@ -122,6 +123,19 @@ export async function fetchLapTelemetry(
     signal: signal ?? null,
   });
   if (!res.ok) throw new Error(`fetchLapTelemetry: HTTP ${res.status}`);
+  return res.json() as Promise<TelemetryPoint[]>;
+}
+
+export async function fetchLiveTelemetry(
+  sessionId: string,
+  lastMs: number = 2000,
+  signal?: AbortSignal,
+): Promise<TelemetryPoint[]> {
+  const res = await fetch(
+    `${API_BASE_URL}/sessions/${encodeURIComponent(sessionId)}/live?last_ms=${encodeURIComponent(lastMs)}`,
+    { signal: signal ?? null },
+  );
+  if (!res.ok) throw new Error(`fetchLiveTelemetry: HTTP ${res.status}`);
   return res.json() as Promise<TelemetryPoint[]>;
 }
 
@@ -245,11 +259,11 @@ export type Projected = {
   y: number;
   speed: number;
   apex: 0 | 1;
-  g_lat?: number;
-  g_lon?: number;
-  lat?: number;
-  lon?: number;
-  timeMs?: number;
+  g_lat?: number | undefined;
+  g_lon?: number | undefined;
+  lat?: number | undefined;
+  lon?: number | undefined;
+  timeMs?: number | undefined;
 };
 
 export type TrackBounds = {
@@ -381,6 +395,105 @@ export function projectPoints(
       timeMs: p.timeMs ?? p.lap_offset_ms,
     };
   });
+}
+
+/**
+ * Catmull-Rom Spline Interpolator for 2D track points.
+ * Produces a densely-sampled, curved trajectory passing through all points,
+ * smoothing sharp jagged GPS segments for both live and recorded circuit views.
+ */
+export function interpolateTrackSpline(
+  points: Projected[],
+  isClosed = false,
+  pointsPerSegment = 4,
+): Projected[] {
+  if (!points || points.length <= 2) return points ? [...points] : [];
+
+  const n = points.length;
+  const result: Projected[] = [];
+
+  const getPt = (i: number): Projected => {
+    if (isClosed) {
+      return points[(i + n) % n]!;
+    }
+    return points[Math.max(0, Math.min(n - 1, i))]!;
+  };
+
+  const segmentsCount = isClosed ? n : n - 1;
+
+  for (let i = 0; i < segmentsCount; i++) {
+    const p0 = getPt(i - 1);
+    const p1 = getPt(i);
+    const p2 = getPt(i + 1);
+    const p3 = getPt(i + 2);
+
+    const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const subSegments = Math.max(1, Math.min(8, Math.round((dist / 10) * pointsPerSegment)));
+
+    for (let s = 0; s < subSegments; s++) {
+      const t = s / subSegments;
+      const t2 = t * t;
+      const t3 = t2 * t;
+
+      // Catmull-Rom spline formula
+      const x =
+        0.5 *
+        (2 * p1.x +
+          (-p0.x + p2.x) * t +
+          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+
+      const y =
+        0.5 *
+        (2 * p1.y +
+          (-p0.y + p2.y) * t +
+          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+
+      const speed = p1.speed + (p2.speed - p1.speed) * t;
+      const g_lat =
+        p1.g_lat !== undefined && p2.g_lat !== undefined
+          ? p1.g_lat + (p2.g_lat - p1.g_lat) * t
+          : undefined;
+      const g_lon =
+        p1.g_lon !== undefined && p2.g_lon !== undefined
+          ? p1.g_lon + (p2.g_lon - p1.g_lon) * t
+          : undefined;
+      const lat =
+        p1.lat !== undefined && p2.lat !== undefined
+          ? p1.lat + (p2.lat - p1.lat) * t
+          : undefined;
+      const lon =
+        p1.lon !== undefined && p2.lon !== undefined
+          ? p1.lon + (p2.lon - p1.lon) * t
+          : undefined;
+
+      result.push({
+        x: Number(x.toFixed(1)),
+        y: Number(y.toFixed(1)),
+        speed: Number(speed.toFixed(1)),
+        apex: t > 0.5 ? p2.apex : p1.apex,
+        g_lat: g_lat !== undefined ? Number(g_lat.toFixed(2)) : undefined,
+        g_lon: g_lon !== undefined ? Number(g_lon.toFixed(2)) : undefined,
+        lat,
+        lon,
+        timeMs:
+          p1.timeMs !== undefined && p2.timeMs !== undefined
+            ? Math.round(p1.timeMs + (p2.timeMs - p1.timeMs) * t)
+            : undefined,
+      });
+    }
+  }
+
+  // Push final endpoint for open tracks
+  if (!isClosed) {
+    const last = points[n - 1]!;
+    result.push({ ...last });
+  } else if (result.length > 0) {
+    result.push({ ...result[0]! });
+  }
+
+  return result;
 }
 
 export type InterpolatedFrame = {
