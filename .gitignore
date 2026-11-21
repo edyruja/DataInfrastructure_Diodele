@@ -4,6 +4,8 @@
 .dev.vars
 *.pem
 *.key
+*.tfvars
+!*.tfvars.example
 
 # Dependente si build-uri
 node_modules/

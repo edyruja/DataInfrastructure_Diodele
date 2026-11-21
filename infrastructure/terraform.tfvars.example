@@ -1,0 +1,6 @@
+# Model de configurare Terraform pentru echipa Diodele
+# Copiați acest fișier ca `terraform.tfvars` și completați cu datele voastre Cloudflare (nu urcați terraform.tfvars pe Git!)
+
+cloudflare_account_id = "your_cloudflare_account_id_here"
+cloudflare_api_token  = "your_cloudflare_api_token_here"
+d1_database_name      = "pero_diodele"
