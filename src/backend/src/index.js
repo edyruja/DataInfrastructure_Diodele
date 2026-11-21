@@ -94,22 +94,67 @@ async function processBatchConsumer(data, env) {
   let ses = sessionStore.get(sessionId);
 
   if (!ses) {
-    // Creem sesiunea în D1 (prima oară)
-    const nowIso = new Date().toISOString();
-    await env.DB.prepare(
-      "INSERT OR IGNORE INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+    // 1. Extragem timestamp-ul de bază al sesiunii direct din sessionId (ex: ses_1795286789116 -> 1795286789116)
+    let sessionBaseTs = firstSampleTs;
+    const tsMatch = sessionId.match(/(\d{12,14})/);
+    if (tsMatch) {
+      sessionBaseTs = parseInt(tsMatch[1], 10);
+    }
+
+    // 2. Verificăm dacă există deja sesiunea în D1 și dacă are tururi anterioare
+    const { results: existingSes } = await env.DB.prepare(
+      "SELECT created_at FROM sessions WHERE session_id = ?"
     )
-      .bind(sessionId, deviceId, trackName, nowIso, nowIso)
-      .run();
+      .bind(sessionId)
+      .all();
+
+    if (!existingSes || existingSes.length === 0) {
+      const nowIso = new Date(sessionBaseTs).toISOString();
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+      )
+        .bind(sessionId, deviceId, trackName, nowIso, nowIso)
+        .run();
+    }
+
+    // Verificăm dacă avem deja tururi finalizate în D1 pentru această sesiune
+    const { results: existingLaps } = await env.DB.prepare(
+      "SELECT lap_number, duration_ms FROM laps WHERE session_id = ? ORDER BY lap_number ASC"
+    )
+      .bind(sessionId)
+      .all();
+
+    let lapNumber = 1;
+    let lapStartTime = sessionBaseTs;
+    if (existingLaps && existingLaps.length > 0) {
+      lapNumber = existingLaps.length + 1;
+      const totalPrevDuration = existingLaps.reduce((acc, l) => acc + (l.duration_ms || 0), 0);
+      lapStartTime = sessionBaseTs + totalPrevDuration;
+    }
+
+    // Căutăm coordonatele de start dacă au fost deja salvate în D1
+    let startLat = data.gps?.lat || 0;
+    let startLon = data.gps?.lon || 0;
+    const { results: firstPt } = await env.DB.prepare(
+      "SELECT lat, lon FROM telemetry_points WHERE lap_id LIKE ? ORDER BY id ASC LIMIT 1"
+    )
+      .bind(`${sessionId}%`)
+      .all();
+
+    if (firstPt && firstPt.length > 0 && firstPt[0].lat && firstPt[0].lon) {
+      startLat = firstPt[0].lat;
+      startLon = firstPt[0].lon;
+    }
 
     ses = {
       sessionId,
       trackName,
       deviceId,
-      startLat: data.gps?.lat || 0,
-      startLon: data.gps?.lon || 0,
-      lapNumber: 1,
-      lapStartTime: firstSampleTs,
+      sessionBaseTs,
+      startLat,
+      startLon,
+      lapNumber,
+      lapStartTime,
       lastSampleTs,
       leftStartZone: false,
       lapMaxSpeed: 0,
@@ -303,7 +348,7 @@ export default {
          FROM telemetry_points tp
          LEFT JOIN laps l ON tp.lap_id = l.lap_id
          WHERE l.session_id = ? OR tp.lap_id LIKE ?
-         ORDER BY tp.id ASC`
+         ORDER BY COALESCE(l.lap_number, 1) ASC, tp.lap_offset_ms ASC, tp.id ASC`
       )
         .bind(sessionId, `${sessionId}%`)
         .all();
@@ -314,7 +359,7 @@ export default {
     if (lapPointsMatch) {
       const lapId = decodeURIComponent(lapPointsMatch[2]);
       const { results } = await env.DB.prepare(
-        "SELECT * FROM telemetry_points WHERE lap_id = ? ORDER BY lap_offset_ms ASC"
+        "SELECT * FROM telemetry_points WHERE lap_id = ? ORDER BY lap_offset_ms ASC, id ASC"
       )
         .bind(lapId)
         .all();
