@@ -603,10 +603,12 @@ function Index() {
 
   const isClosedLoop = useMemo(() => {
     if (activeTrackPoints.length < 15) return false;
+    // Nu forțăm închiderea traseului dacă nu există cel puțin un tur complet finalizat
+    if (laps.length === 0) return false;
     const first = activeTrackPoints[0]!;
     const last = activeTrackPoints[activeTrackPoints.length - 1]!;
-    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 35;
-  }, [activeTrackPoints]);
+    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 25;
+  }, [activeTrackPoints, laps.length]);
 
   // Track GPS waypoints: deduplicates consecutive stationary points for continuous 60 FPS trajectory
   const trackWaypoints = useMemo(() => {
