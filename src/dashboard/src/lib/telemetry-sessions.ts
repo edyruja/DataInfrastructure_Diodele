@@ -146,19 +146,22 @@ export function formatSessionDateTime(iso: string): string {
   }
 }
 
-/** Format duration_ms as "M:SS.mmm"  e.g. 64320 → "1:04.320" */
+/** Format duration_ms as "M:SS.mmm" (integer milliseconds, 3 decimals) e.g. 64320 → "1:04.320", 4841 → "0:04.841" */
 export function formatLapTime(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
+  if (!isFinite(ms) || ms < 0) return "0:00.000";
+  const roundedMs = Math.round(ms);
+  const totalSec = Math.floor(roundedMs / 1000);
   const minutes = Math.floor(totalSec / 60);
   const seconds = totalSec % 60;
-  const millis = ms % 1000;
+  const millis = roundedMs % 1000;
   return `${minutes}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
 }
 
-/** Format delta vs best in ms e.g. +1240 → "+1.240s" */
+/** Format delta vs best in ms (integer milliseconds, 3 decimals) e.g. +1240 → "+1.240s" */
 export function formatDelta(ms: number): string {
+  if (!isFinite(ms)) return "—";
   const sign = ms >= 0 ? "+" : "−";
-  const abs = Math.abs(ms);
+  const abs = Math.round(Math.abs(ms));
   const secs = Math.floor(abs / 1000);
   const millis = abs % 1000;
   return `${sign}${secs}.${String(millis).padStart(3, "0")}s`;
@@ -308,6 +311,100 @@ export function projectPoints(
       apex: p.is_corner_apex,
     };
   });
+}
+
+export type InterpolatedFrame = {
+  index: number;
+  alpha: number;
+  timeMs: number;
+  lat: number;
+  lon: number;
+  speed_kmh: number;
+  g_lat: number;
+  g_lon: number;
+  total_g: number;
+  is_corner_apex: 0 | 1;
+};
+
+/**
+ * 60 FPS Telemetry Interpolator
+ * Efficient binary-search + linear interpolation between recorded telemetry points.
+ */
+export function interpolateTelemetryPoint(
+  points: TelemetryPoint[],
+  timeMs: number,
+): InterpolatedFrame | null {
+  if (!points || points.length === 0) return null;
+
+  const first = points[0]!;
+  if (points.length === 1 || timeMs <= first.lap_offset_ms) {
+    return {
+      index: 0,
+      alpha: 0,
+      timeMs: first.lap_offset_ms,
+      lat: first.lat,
+      lon: first.lon,
+      speed_kmh: first.speed_kmh,
+      g_lat: first.g_lat,
+      g_lon: first.g_lon,
+      total_g: Math.hypot(first.g_lat, first.g_lon),
+      is_corner_apex: first.is_corner_apex,
+    };
+  }
+
+  const last = points[points.length - 1]!;
+  if (timeMs >= last.lap_offset_ms) {
+    return {
+      index: points.length - 1,
+      alpha: 1,
+      timeMs: last.lap_offset_ms,
+      lat: last.lat,
+      lon: last.lon,
+      speed_kmh: last.speed_kmh,
+      g_lat: last.g_lat,
+      g_lon: last.g_lon,
+      total_g: Math.hypot(last.g_lat, last.g_lon),
+      is_corner_apex: last.is_corner_apex,
+    };
+  }
+
+  // Binary search: find largest index where points[mid].lap_offset_ms <= timeMs
+  let low = 0;
+  let high = points.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (points[mid]!.lap_offset_ms <= timeMs) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const idx = Math.max(0, high);
+  const nextIdx = Math.min(points.length - 1, idx + 1);
+  const p0 = points[idx]!;
+  const p1 = points[nextIdx]!;
+
+  const span = p1.lap_offset_ms - p0.lap_offset_ms;
+  const rawAlpha = span > 0 ? (timeMs - p0.lap_offset_ms) / span : 0;
+  const alpha = Math.max(0, Math.min(1, rawAlpha));
+
+  const g_lat = Number((p0.g_lat + (p1.g_lat - p0.g_lat) * alpha).toFixed(2));
+  const g_lon = Number((p0.g_lon + (p1.g_lon - p0.g_lon) * alpha).toFixed(2));
+  const speed_kmh = Number((p0.speed_kmh + (p1.speed_kmh - p0.speed_kmh) * alpha).toFixed(1));
+
+  return {
+    index: idx,
+    alpha,
+    timeMs,
+    lat: p0.lat + (p1.lat - p0.lat) * alpha,
+    lon: p0.lon + (p1.lon - p0.lon) * alpha,
+    speed_kmh,
+    g_lat,
+    g_lon,
+    total_g: Number(Math.hypot(g_lat, g_lon).toFixed(2)),
+    is_corner_apex: alpha > 0.5 ? p1.is_corner_apex : p0.is_corner_apex,
+  };
 }
 
 /**

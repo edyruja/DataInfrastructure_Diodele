@@ -7,7 +7,55 @@ import {
   computeTrackBounds,
   projectPoints,
   snapPointToPolyline,
+  interpolateTelemetryPoint,
 } from "@/lib/telemetry-sessions";
+
+describe("interpolateTelemetryPoint", () => {
+  const points = [
+    {
+      lap_id: "l1",
+      lap_number: 1,
+      lap_offset_ms: 0,
+      lat: 46.78,
+      lon: 23.61,
+      speed_kmh: 50,
+      bearing: 0,
+      g_lat: 0.1,
+      g_lon: 0.2,
+      is_corner_apex: 0 as const,
+    },
+    {
+      lap_id: "l1",
+      lap_number: 1,
+      lap_offset_ms: 100,
+      lat: 46.782,
+      lon: 23.612,
+      speed_kmh: 60,
+      bearing: 0,
+      g_lat: 0.3,
+      g_lon: -0.1,
+      is_corner_apex: 1 as const,
+    },
+  ];
+
+  it("interpolates exactly at 50ms (midpoint)", () => {
+    const res = interpolateTelemetryPoint(points, 50);
+    expect(res).not.toBeNull();
+    expect(res!.speed_kmh).toBeCloseTo(55, 1);
+    expect(res!.g_lat).toBeCloseTo(0.2, 2);
+    expect(res!.g_lon).toBeCloseTo(0.05, 2);
+    expect(res!.lat).toBeCloseTo(46.781, 4);
+    expect(res!.lon).toBeCloseTo(23.611, 4);
+    expect(res!.alpha).toBeCloseTo(0.5, 2);
+  });
+
+  it("handles boundary before start and after end", () => {
+    const before = interpolateTelemetryPoint(points, -10);
+    expect(before!.speed_kmh).toBe(50);
+    const after = interpolateTelemetryPoint(points, 200);
+    expect(after!.speed_kmh).toBe(60);
+  });
+});
 
 describe("snapPointToPolyline", () => {
   it("snaps a point slightly off a track segment onto the segment", () => {
@@ -87,23 +135,28 @@ describe("formatSessionDateTime", () => {
 });
 
 describe("formatLapTime", () => {
-  it("formats milliseconds as M:SS.mmm", () => {
+  it("formats milliseconds as M:SS.mmm (3 decimals for milliseconds)", () => {
     expect(formatLapTime(64320)).toBe("1:04.320");
     expect(formatLapTime(74890)).toBe("1:14.890");
     expect(formatLapTime(78410)).toBe("1:18.410");
+    expect(formatLapTime(4841)).toBe("0:04.841");
     expect(formatLapTime(0)).toBe("0:00.000");
+  });
+
+  it("handles floating point ms gracefully without decimal leakage", () => {
+    expect(formatLapTime(29193.899999999994)).toBe("0:29.194");
   });
 });
 
 describe("formatDelta", () => {
-  it("formats positive delta with + sign", () => {
+  it("formats positive delta with + sign and 3 decimals", () => {
     expect(formatDelta(1240)).toBe("+1.240s");
     expect(formatDelta(530)).toBe("+0.530s");
   });
   it("formats zero delta", () => {
     expect(formatDelta(0)).toBe("+0.000s");
   });
-  it("formats negative delta with − sign", () => {
+  it("formats negative delta with − sign and 3 decimals", () => {
     expect(formatDelta(-500)).toBe("−0.500s");
   });
 });
