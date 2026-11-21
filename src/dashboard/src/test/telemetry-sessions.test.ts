@@ -8,7 +8,42 @@ import {
   projectPoints,
   snapPointToPolyline,
   interpolateTelemetryPoint,
+  extractGpsWaypoints,
+  interpolateTrackPosition,
 } from "@/lib/telemetry-sessions";
+
+describe("extractGpsWaypoints and interpolateTrackPosition (60 FPS smooth circuit movement)", () => {
+  const rawPoints = [
+    // 4 points with identical GPS (simulating phone accelerometer batch)
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 0, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 250, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 500, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 750, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+    // Next GPS fix at t=1000
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 1000, lat: 46.7810, lon: 23.6110, speed_kmh: 40, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+  ];
+
+  it("extracts distinct GPS waypoints without duplicate stationary coordinates", () => {
+    const waypoints = extractGpsWaypoints(rawPoints);
+    expect(waypoints.length).toBe(2);
+    expect(waypoints[0]!.timeMs).toBe(0);
+    expect(waypoints[1]!.timeMs).toBe(1000);
+  });
+
+  it("interpolates continuous 60 FPS trajectory between GPS fixes without pausing or teleporting", () => {
+    const waypoints = extractGpsWaypoints(rawPoints);
+    // At t = 250ms (where raw points were previously frozen)
+    const at250 = interpolateTrackPosition(waypoints, 250);
+    expect(at250).not.toBeNull();
+    expect(at250!.lat).toBeCloseTo(46.78025, 5); // Smoothly 25% of the distance!
+    expect(at250!.lon).toBeCloseTo(23.61025, 5);
+
+    // At t = 500ms
+    const at500 = interpolateTrackPosition(waypoints, 500);
+    expect(at500!.lat).toBeCloseTo(46.7805, 5); // Smoothly 50% of the distance!
+    expect(at500!.lon).toBeCloseTo(23.6105, 5);
+  });
+});
 
 describe("interpolateTelemetryPoint", () => {
   const points = [

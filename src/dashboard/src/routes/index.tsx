@@ -34,6 +34,8 @@ import {
   snapPointToPolyline,
   haversineMeters,
   interpolateTelemetryPoint,
+  extractGpsWaypoints,
+  interpolateTrackPosition,
 } from "@/lib/telemetry-sessions";
 
 // ---------------------------------------------------------------------------
@@ -371,39 +373,53 @@ function Index() {
     return telemetry;
   }, [referenceTrack, isCurrentSessionLive, liveTrackPoints, telemetry]);
 
+  // Track GPS waypoints: deduplicates consecutive stationary points for continuous 60 FPS trajectory
+  const trackWaypoints = useMemo(() => {
+    return extractGpsWaypoints(activeTrackPoints);
+  }, [activeTrackPoints]);
+
   // Track bounding box (smooth auto-expansion during Lap 1, locked on Lap 2+)
   const trackBounds = useMemo(() => {
-    return computeTrackBounds(activeTrackPoints);
-  }, [activeTrackPoints]);
+    const pts = trackWaypoints.length > 0 ? trackWaypoints : activeTrackPoints;
+    return computeTrackBounds(pts);
+  }, [trackWaypoints, activeTrackPoints]);
 
   // Full projected track points inside SVG viewBox (400 x 220)
   const fullProjectedTrack = useMemo(() => {
-    return projectPoints(activeTrackPoints, 400, 220, 24, trackBounds);
-  }, [activeTrackPoints, trackBounds]);
+    const pts = trackWaypoints.length > 0 ? trackWaypoints : activeTrackPoints;
+    return projectPoints(pts, 400, 220, 24, trackBounds);
+  }, [trackWaypoints, activeTrackPoints, trackBounds]);
 
-  // Dynamic track polyline: In Replay Mode, evolves dynamically at 60 FPS up to current point!
+  // Smooth 60 FPS Track Position for Replay (interpolates continuously along waypoints)
+  const replayTrackPos = useMemo(() => {
+    if (!isReplaying || replayTimeMs === null || trackWaypoints.length === 0) return null;
+    return interpolateTrackPosition(trackWaypoints, baseTimeMs + replayTimeMs);
+  }, [isReplaying, replayTimeMs, trackWaypoints, baseTimeMs]);
+
+  // Dynamic track polyline: In Replay Mode, evolves dynamically at 60 FPS up to current car position!
   const projectedTrack = useMemo(() => {
-    if (!isReplaying || !currentReplayFrame || fullProjectedTrack.length === 0) {
+    if (!isReplaying || !replayTrackPos || !trackBounds || fullProjectedTrack.length === 0) {
       return fullProjectedTrack;
     }
-    const sliced = fullProjectedTrack.slice(0, currentReplayFrame.index + 1);
-    const p0 = fullProjectedTrack[currentReplayFrame.index];
-    const p1 = fullProjectedTrack[currentReplayFrame.index + 1];
-    if (p0 && p1 && currentReplayFrame.alpha > 0) {
-      const curX = p0.x + (p1.x - p0.x) * currentReplayFrame.alpha;
-      const curY = p0.y + (p1.y - p0.y) * currentReplayFrame.alpha;
-      return [
-        ...sliced,
-        {
-          x: curX,
-          y: curY,
-          speed: currentReplayFrame.speed_kmh,
-          apex: currentReplayFrame.is_corner_apex,
-        },
-      ];
-    }
-    return sliced;
-  }, [isReplaying, currentReplayFrame, fullProjectedTrack]);
+    const sliced = fullProjectedTrack.slice(0, replayTrackPos.index + 1);
+    const carPos = projectCoordWithBounds(
+      replayTrackPos.lat,
+      replayTrackPos.lon,
+      trackBounds,
+      400,
+      220,
+      24,
+    );
+    return [
+      ...sliced,
+      {
+        x: carPos.x,
+        y: carPos.y,
+        speed: replayTrackPos.speed_kmh,
+        apex: 0,
+      },
+    ];
+  }, [isReplaying, replayTrackPos, fullProjectedTrack, trackBounds]);
 
   const startPoint = fullProjectedTrack.length > 0 ? fullProjectedTrack[0] : null;
   const isClosedLoop = useMemo(() => {
@@ -425,28 +441,25 @@ function Index() {
   }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
   // ── Live / Replay Car Dot ────────────────────────────────────────────────
-  // In Replay Mode: car moves smoothly at 60 FPS along the circuit track.
+  // In Replay Mode: car moves continuously at 60 FPS along the circuit track without pausing or jumping.
   // In Live Mode: snaps to reference track on Lap 2+, tracks leading edge on Lap 1.
   const carDot = useMemo(() => {
     // 1. Replay Mode:
-    if (isReplaying && currentReplayFrame && fullProjectedTrack.length > 0) {
-      const p0 = fullProjectedTrack[currentReplayFrame.index];
-      const p1 = fullProjectedTrack[currentReplayFrame.index + 1];
-      if (p0 && p1) {
-        return {
-          x: p0.x + (p1.x - p0.x) * currentReplayFrame.alpha,
-          y: p0.y + (p1.y - p0.y) * currentReplayFrame.alpha,
-          speed: currentReplayFrame.speed_kmh,
-          isSnapped: false,
-        };
-      } else if (p0) {
-        return {
-          x: p0.x,
-          y: p0.y,
-          speed: currentReplayFrame.speed_kmh,
-          isSnapped: false,
-        };
-      }
+    if (isReplaying && replayTrackPos && trackBounds) {
+      const pos = projectCoordWithBounds(
+        replayTrackPos.lat,
+        replayTrackPos.lon,
+        trackBounds,
+        400,
+        220,
+        24,
+      );
+      return {
+        x: pos.x,
+        y: pos.y,
+        speed: replayTrackPos.speed_kmh,
+        isSnapped: false,
+      };
     }
 
     // 2. Live Mode:
@@ -486,7 +499,7 @@ function Index() {
     };
   }, [
     isReplaying,
-    currentReplayFrame,
+    replayTrackPos,
     fullProjectedTrack,
     isCurrentSessionLive,
     liveFrame,
