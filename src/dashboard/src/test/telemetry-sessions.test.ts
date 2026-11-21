@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatLapTime,
   formatDelta,
+  isLapValid,
   speedColor,
   formatSessionDateTime,
   computeTrackBounds,
@@ -203,5 +204,65 @@ describe("speedColor", () => {
   });
   it("handles zero maxSpeed without throwing", () => {
     expect(() => speedColor(0, 0)).not.toThrow();
+  });
+});
+
+describe("isLapValid and Best Lap Selection", () => {
+  const sessionLaps = [
+    {
+      lap_id: "ses_lap_01",
+      lap_number: 1,
+      duration_ms: 105862, // 1:45.862
+      max_speed_kmh: 59.3,
+      avg_speed_kmh: 45.1,
+      max_g_lat: 0.32,
+      max_g_brake: 0.28,
+    },
+    {
+      lap_id: "ses_lap_02",
+      lap_number: 2,
+      duration_ms: 98943, // 1:38.943
+      max_speed_kmh: 55.7,
+      avg_speed_kmh: 46.8,
+      max_g_lat: 0.21,
+      max_g_brake: 0.22,
+    },
+    {
+      lap_id: "ses_lap_03",
+      lap_number: 3,
+      duration_ms: 4055, // 0:04.055 (incomplete lap stopped prematurely)
+      max_speed_kmh: 43.2,
+      avg_speed_kmh: 30.1,
+      max_g_lat: 0.09,
+      max_g_brake: 0.07,
+    },
+  ];
+
+  it("marks completed laps as valid and incomplete laps under 15s as invalid", () => {
+    expect(isLapValid(sessionLaps[0]!, sessionLaps)).toBe(true);
+    expect(isLapValid(sessionLaps[1]!, sessionLaps)).toBe(true);
+    expect(isLapValid(sessionLaps[2]!, sessionLaps)).toBe(false);
+  });
+
+  it("excludes incomplete laps when finding session best lap, picking L2 instead of L3", () => {
+    const validLaps = sessionLaps.filter((l) => isLapValid(l, sessionLaps));
+    expect(validLaps.length).toBe(2);
+    expect(validLaps.map((l) => l.lap_number)).toEqual([1, 2]);
+
+    const bestLap = validLaps.reduce<typeof sessionLaps[0] | null>(
+      (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
+      null,
+    );
+
+    expect(bestLap).not.toBeNull();
+    expect(bestLap!.lap_number).toBe(2);
+    expect(bestLap!.duration_ms).toBe(98943);
+  });
+
+  it("calculates accurate delta for L1 relative to L2 (+6.919s instead of +101s)", () => {
+    const l1 = sessionLaps[0]!;
+    const best = sessionLaps[1]!; // L2
+    const deltaMs = l1.duration_ms - best.duration_ms;
+    expect(formatDelta(deltaMs)).toBe("+6.919s");
   });
 });
