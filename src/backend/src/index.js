@@ -1,3 +1,7 @@
+// ---------------------------------------------------------------------------
+// Physics & Geo Metrics Helpers (Self-contained for Terraform / Worker bundle)
+// ---------------------------------------------------------------------------
+
 export function computeSampleSliceMetrics(slice, speedKmh) {
   if (!slice || slice.length === 0) {
     return {
@@ -44,6 +48,10 @@ export function haversineMeters(lat1, lon1, lat2, lon2) {
       Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+
+// ---------------------------------------------------------------------------
+// Telemetry Hub (Durable Object)
+// ---------------------------------------------------------------------------
 
 export class TelemetryHub {
   constructor(state, env) {
@@ -190,6 +198,8 @@ export class TelemetryHub {
         ses.leftStartZone = true;
       } else if (dist < 15 && ses.leftStartZone && lastSampleTs - ses.lapStartTime > 10000) {
         await this.saveCompletedLap(ses, lastSampleTs);
+        const completedLap = ses.lapNumber;
+        const lapDuration = Math.max(0, lastSampleTs - ses.lapStartTime);
         ses.lapNumber += 1;
         ses.lapStartTime = lastSampleTs;
         ses.leftStartZone = false;
@@ -198,6 +208,13 @@ export class TelemetryHub {
         ses.lapPointCount = 0;
         ses.lapMaxGLat = 0;
         ses.lapMaxGBrake = 0;
+
+        this.broadcastToWeb({
+          type: "LAP_COMPLETED",
+          session_id: ses.sessionId,
+          lap_number: completedLap,
+          duration_ms: lapDuration,
+        });
       }
     }
 
@@ -297,16 +314,16 @@ export default {
       return env.TELEMETRY_HUB.get(id).fetch(request);
     }
 
-    if (url.pathname === "/api/sessions") {
+    if (url.pathname === "/api/sessions" || url.pathname === "/sessions") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 50"
       ).all();
       return Response.json(results, { headers: corsHeaders });
     }
 
-    const lapsMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/laps$/);
+    const lapsMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/laps$/);
     if (lapsMatch) {
-      const sessionId = decodeURIComponent(lapsMatch[1]);
+      const sessionId = decodeURIComponent(lapsMatch[2]);
       const { results } = await env.DB.prepare(
         "SELECT * FROM laps WHERE session_id = ? ORDER BY lap_number ASC"
       )
@@ -315,24 +332,24 @@ export default {
       return Response.json(results, { headers: corsHeaders });
     }
 
-    const telemetryMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/telemetry$/);
+    const telemetryMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/telemetry$/);
     if (telemetryMatch) {
-      const sessionId = decodeURIComponent(telemetryMatch[1]);
+      const sessionId = decodeURIComponent(telemetryMatch[2]);
       const { results } = await env.DB.prepare(
-        `SELECT tp.*, l.lap_number 
+        `SELECT tp.*, COALESCE(l.lap_number, 1) as lap_number 
          FROM telemetry_points tp 
-         JOIN laps l ON tp.lap_id = l.lap_id 
-         WHERE l.session_id = ? 
-         ORDER BY l.lap_number ASC, tp.lap_offset_ms ASC`
+         LEFT JOIN laps l ON tp.lap_id = l.lap_id 
+         WHERE l.session_id = ? OR tp.lap_id LIKE ?
+         ORDER BY tp.id ASC`
       )
-        .bind(sessionId)
+        .bind(sessionId, `${sessionId}%`)
         .all();
       return Response.json(results, { headers: corsHeaders });
     }
 
-    const lapPointsMatch = url.pathname.match(/^\/api\/laps\/([^/]+)\/telemetry$/);
+    const lapPointsMatch = url.pathname.match(/^(\/api)?\/laps\/([^/]+)\/telemetry$/);
     if (lapPointsMatch) {
-      const lapId = decodeURIComponent(lapPointsMatch[1]);
+      const lapId = decodeURIComponent(lapPointsMatch[2]);
       const { results } = await env.DB.prepare(
         "SELECT * FROM telemetry_points WHERE lap_id = ? ORDER BY lap_offset_ms ASC"
       )
