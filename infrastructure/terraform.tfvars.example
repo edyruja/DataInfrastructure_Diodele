@@ -1,8 +1,15 @@
-# Model de configurare Terraform pentru echipa Diodele
-# Copiați acest fișier ca `terraform.tfvars` și completați cu datele voastre Cloudflare (nu urcați terraform.tfvars pe Git!)
+# Copiază fișierul ca terraform.tfvars pentru a schimba setările.
+# Furnizează tokenul prin variabila de mediu CLOUDFLARE_API_TOKEN.
 
 cloudflare_account_id = "dfe48fe11d5dfc0dc30a84dab037aff9"
-cloudflare_api_token  = "your_cloudflare_api_token_here"
 d1_database_name      = "pero_diodele"
 backend_worker_name   = "datainfrastructure-diodele"
 dashboard_worker_name = "datainfrastructure-diodele12"
+workers_dev_subdomain = "cristianstefanpopa05"
+telemetry_queue_name  = "telemetry-queue"
+
+# Pentru o coadă cu un consumator configurat deja prin Wrangler.
+# manage_queue_consumer = false
+
+# Pentru o singură aplicare, dacă Worker-ul existent încă are migrarea v1.
+# migrate_legacy_telemetry_hub = true

@@ -1,58 +1,58 @@
-# Infrastructure as Code (IaC) — Echipa Diodele
+# Infrastructura Cloudflare
 
-Acest folder conține specificațiile declarative de infrastructură Cloudflare definite prin **Terraform**.
+Aplicația mobilă trimite datele la `POST /api/telemetry`. Worker-ul `datainfrastructure-diodele` le publică în coada `telemetry-queue` prin binding-ul `TELEMETRY_QUEUE`. Același Worker consumă loturi de până la 50 de mesaje, cu o așteptare de cel mult o secundă pentru formarea lotului, și salvează rezultatele în D1 prin binding-ul `DB`.
 
-## Componente Gestionate
+Dashboard-ul `datainfrastructure-diodele12` rulează ca Worker. Terraform publică modulele SSR din `src/dashboard/.output/server` și fișierele statice din `src/dashboard/.output/public` prin binding-ul `ASSETS`.
 
-1. **Cloudflare Account ID**:
-   * `dfe48fe11d5dfc0dc30a84dab037aff9`
+## Pregătire
 
-2. **Cloudflare D1 Database (`cloudflare_d1_database.telemetry_db`)**:
-   * Nume: `pero_diodele`
-   * ID instanță: `39ed8046-a6ba-440f-9b3f-0585373a0750`
-   * Baza de date SQLite distribuită pentru persistența sesiunilor, tururilor și punctelor de telemetrie.
+Folosește Terraform 1.7 sau mai nou, Node.js 22.12 sau mai nou și un token Cloudflare cu permisiunile de cont `D1 Edit`, `Workers Scripts Edit` și `Queues Edit`. Configurează tokenul prin `CLOUDFLARE_API_TOKEN` și confirmă că subdomeniul `workers.dev` al contului este înregistrat. Dacă folosești alt cont sau alte nume decât cele implicite, modifică o copie a fișierului `terraform.tfvars.example` numită `terraform.tfvars` și construiește dashboard-ul cu `VITE_API_URL` setat la URL-ul backend-ului tău.
 
-3. **Cloudflare Backend Worker (`cloudflare_workers_script.telemetry_worker`)**:
-   * Nume: `datainfrastructure-diodele`
-   * URL: `https://datainfrastructure-diodele.cristianstefanpopa05.workers.dev`
-   * WebSocket: `wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws`
-   * Script: `src/backend/src/index.js` (unificat și self-contained)
-   * Binding: `d1_database_binding` conectat automat la instanța D1 (`env.DB`).
+Rulează comenzile de pregătire din rădăcina proiectului.
 
-4. **Cloudflare Dashboard Web (`cloudflare_pages_project.dashboard_pages`)**:
-   * Nume: `datainfrastructure-diodele12`
-   * URL: `https://datainfrastructure-diodele12.cristianstefanpopa05.workers.dev`
-   * Interfața web TanStack Start / Vite (`src/dashboard`)
-   * Binding: Static Assets (`ASSETS`).
-
-## Utilizare
-
-### 1. Inițializare
 ```bash
-cd infrastructure
-terraform init
+npm --prefix src/dashboard ci
+npm --prefix src/dashboard run build
+terraform -chdir=infrastructure init -upgrade
+terraform -chdir=infrastructure validate
 ```
 
-### 2. Configurare variabile
-Copiați fișierul exemplu și adăugați credențialele:
+## Resurse existente
+
+Dacă ai deja un state Terraform, folosește-l în continuare. Providerul v5 migrează state-ul pentru D1 și Worker-ul de backend la aceleași adrese. La aplicare, Terraform scoate vechiul proiect Pages din state și îl păstrează în Cloudflare. [Ghidul Cloudflare pentru migrarea la v5](https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs/guides/version-5-migration)
+
+Importă resursele existente care lipsesc din state. Înlocuiește `ACCOUNT_ID` și `QUEUE_ID` cu ID-urile Cloudflare ale contului și cozii.
+
 ```bash
-cp terraform.tfvars.example terraform.tfvars
+terraform -chdir=infrastructure import cloudflare_d1_database.telemetry_db ACCOUNT_ID/39ed8046-a6ba-440f-9b3f-0585373a0750
+terraform -chdir=infrastructure import cloudflare_queue.telemetry_queue ACCOUNT_ID/QUEUE_ID
+terraform -chdir=infrastructure import cloudflare_workers_script.telemetry_worker ACCOUNT_ID/datainfrastructure-diodele
+terraform -chdir=infrastructure import cloudflare_workers_script.dashboard ACCOUNT_ID/datainfrastructure-diodele12
 ```
 
-### 3. Sincronizarea resurselor existente (Terraform Import)
+Dacă `telemetry-queue` are deja consumatorul configurat prin Wrangler, setează `manage_queue_consumer = false` în `terraform.tfvars`. Providerul Cloudflare nu poate importa consumatorul existent. Pentru o coadă fără consumator, valoarea implicită creează asocierea cu Worker-ul de telemetrie. [Resursa Terraform pentru consumatorul cozii](https://registry.terraform.io/providers/cloudflare/cloudflare/5.29.0/docs/resources/queue_consumer)
+
+Dacă Worker-ul de telemetrie are încă migrarea `v1`, aplică o singură dată cu `-var=migrate_legacy_telemetry_hub=true` pentru a elimina clasa veche `TelemetryHub`. Pentru un Worker nou sau migrat deja la `v2`, folosește valoarea implicită.
+
+## Inițializarea unei baze D1 noi
+
+Pentru o bază D1 nouă, creeaz-o și aplică schema din `src/backend/schema.sql` înainte de a publica backend-ul. Comenzile folosesc contul și numele implicite din proiect.
+
 ```bash
-# Import baza D1:
-terraform import cloudflare_d1_database.telemetry_db dfe48fe11d5dfc0dc30a84dab037aff9/39ed8046-a6ba-440f-9b3f-0585373a0750
-
-# Import Backend Worker:
-terraform import cloudflare_workers_script.telemetry_worker dfe48fe11d5dfc0dc30a84dab037aff9/datainfrastructure-diodele
-
-# Import Dashboard Pages / Worker:
-terraform import cloudflare_pages_project.dashboard_pages dfe48fe11d5dfc0dc30a84dab037aff9/datainfrastructure-diodele12
+terraform -chdir=infrastructure apply -target=cloudflare_d1_database.telemetry_db
+DATABASE_NAME=$(terraform -chdir=infrastructure output -raw database_name)
+(
+  cd src/backend
+  npm install --no-package-lock
+  npx wrangler d1 execute "$DATABASE_NAME" --remote --file=schema.sql
+)
 ```
 
-### 4. Validare și Planificare
+## Planificare și aplicare
+
 ```bash
-terraform validate
-terraform plan
+terraform -chdir=infrastructure plan
+terraform -chdir=infrastructure apply
 ```
+
+Output-urile includ ID-ul bazei D1, numele și ID-ul cozii și URL-urile celor două Workers.
