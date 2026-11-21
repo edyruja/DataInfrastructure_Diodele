@@ -26,6 +26,7 @@ import {
   fetchTelemetry,
   formatLapTime,
   formatDelta,
+  isLapValid,
   formatSessionDateTime,
   speedColor,
   computeTrackBounds,
@@ -611,13 +612,78 @@ function Index() {
     referenceTrack.length,
   ]);
 
+  // Dynamic speed trace polyline:
+  // - In Replay Mode: evolves dynamically at 60 FPS up to the replay car position.
+  // - In Live Mode on Lap 2+: renders ONLY the colored trace for the current lap (Lap 2, 3, etc.)
+  //   behind the moving car, while fullProjectedTrack provides the road contour overlay underneath.
+  // - In Live Mode on Lap 1: follows the live car as Lap 1 is driven.
+  // - In Recorded Sessions: renders the full trace of the selected lap.
+  const activeSpeedTrace = useMemo(() => {
+    if (isReplaying) {
+      return projectedTrack;
+    }
+
+    const currentLiveLap = liveFrame?.current_lap ?? 1;
+    const isLiveLap2Plus =
+      isCurrentSessionLive && (currentLiveLap >= 2 || laps.length > 0) && referenceTrack.length > 0;
+
+    if (isLiveLap2Plus && trackBounds) {
+      const currentLapPoints = liveTrackPoints.filter(
+        (p) => (p.lap_number ?? 1) === currentLiveLap,
+      );
+      if (currentLapPoints.length === 0) {
+        return carDot ? [carDot] : [];
+      }
+      const pts = currentLapPoints.map((p) => {
+        const raw = projectCoordWithBounds(p.lat, p.lon, trackBounds, 400, 220, 24);
+        const snapped =
+          fullProjectedTrack.length > 1 ? snapPointToPolyline(raw, fullProjectedTrack, 30) : raw;
+        return {
+          x: snapped.x,
+          y: snapped.y,
+          speed: p.speed_kmh ?? 0,
+          apex: p.apex ?? 0,
+        };
+      });
+      if (carDot && pts.length > 0) {
+        pts[pts.length - 1] = {
+          x: carDot.x,
+          y: carDot.y,
+          speed: carDot.speed,
+          apex: 0,
+        };
+      }
+      return pts;
+    }
+
+    return fullProjectedTrack;
+  }, [
+    isReplaying,
+    projectedTrack,
+    isCurrentSessionLive,
+    liveFrame?.current_lap,
+    laps.length,
+    referenceTrack.length,
+    trackBounds,
+    liveTrackPoints,
+    fullProjectedTrack,
+    carDot,
+  ]);
+
   // Overall points buffer for KPIs
   const allPoints = isCurrentSessionLive ? liveTrackPoints : telemetry;
 
-  const bestLap = laps.reduce<ApiLap | null>(
-    (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
-    null,
-  );
+  // Filter completed and valid laps only (incomplete or aborted laps under 15s are excluded)
+  const validLaps = useMemo(() => {
+    return laps.filter((l) => isLapValid(l, laps, telemetry));
+  }, [laps, telemetry]);
+
+  const bestLap = useMemo(() => {
+    return validLaps.reduce<ApiLap | null>(
+      (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
+      null,
+    );
+  }, [validLaps]);
 
   const maxSpeed = useMemo(() => {
     const liveSpeed = isCurrentSessionLive && liveFrame ? liveFrame.frame.speed_kmh : 0;
@@ -690,10 +756,13 @@ function Index() {
   // Current session object
   const session = orderedSessions.find((s) => s.session_id === sessionId);
 
-  // Visible laps (all | valid only: duration > 0 or lap > 1)
-  const visibleLaps = validOnly
-    ? laps.filter((l) => l.lap_number > 1 || l.duration_ms > 0)
-    : laps;
+  // Visible laps: All laps or Valid only (incomplete laps filtered out)
+  const visibleLaps = useMemo(() => {
+    if (validOnly) {
+      return laps.filter((l) => isLapValid(l, laps, telemetry));
+    }
+    return laps;
+  }, [validOnly, laps, telemetry]);
 
   // G-G scatter: in Replay mode, shows points appearing sequentially up to current timestamp!
   const gSample = useMemo(() => {
@@ -1125,31 +1194,11 @@ function Index() {
             <svg viewBox="0 0 400 220" className="mt-4 w-full select-none">
               {fullProjectedTrack.length > 1 ? (
                 <>
-                  {/* Faint Ghost Track Outline when Replaying (to see full circuit ahead) */}
-                  {isReplaying && (
-                    <>
-                      <polyline
-                        points={fullProjectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
-                        fill="none"
-                        stroke="rgba(255, 255, 255, 0.05)"
-                        strokeWidth="15"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                      <polyline
-                        points={fullProjectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
-                        fill="none"
-                        stroke="rgba(255, 255, 255, 0.02)"
-                        strokeWidth="11"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </>
-                  )}
-
-                  {/* Road Corridor Outer Border / Curbs (Traseu cu lățime reală) */}
+                  {/* Road Corridor Outer Border / Curbs (Circuit Outline / Overlay) */}
                   <polyline
-                    points={projectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                    points={(referenceTrack.length > 0 || isReplaying ? fullProjectedTrack : projectedTrack)
+                      .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+                      .join(" ")}
                     fill="none"
                     stroke="rgba(255, 255, 255, 0.09)"
                     strokeWidth="15"
@@ -1159,7 +1208,9 @@ function Index() {
 
                   {/* Road Asphalt Surface */}
                   <polyline
-                    points={projectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                    points={(referenceTrack.length > 0 || isReplaying ? fullProjectedTrack : projectedTrack)
+                      .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+                      .join(" ")}
                     fill="none"
                     stroke="#141416"
                     strokeWidth="11"
@@ -1168,8 +1219,8 @@ function Index() {
                   />
 
                   {/* Per-segment Coloured Speed Trace */}
-                  {projectedTrack.slice(0, -1).map((pt, i) => {
-                    const next = projectedTrack[i + 1];
+                  {activeSpeedTrace.slice(0, -1).map((pt, i) => {
+                    const next = activeSpeedTrace[i + 1];
                     if (!next) return null;
                     return (
                       <line
@@ -1441,7 +1492,7 @@ function Index() {
               <h2 className="font-medium">
                 Session laps{" "}
                 <span className="ml-2 rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                  {laps.length} total
+                  {validOnly ? `${visibleLaps.length} valid` : `${laps.length} total`}
                 </span>
               </h2>
               {selectedLapId && (
@@ -1496,10 +1547,11 @@ function Index() {
                       </tr>
                     ))
                   : visibleLaps.map((lap) => {
-                      const isBest = bestLap?.lap_id === lap.lap_id;
+                      const isValid = isLapValid(lap, laps, telemetry);
+                      const isBest = isValid && bestLap?.lap_id === lap.lap_id;
                       const isSelected = selectedLapId === lap.lap_id;
                       const delta =
-                        bestLap && !isBest && lap.duration_ms > 0
+                        isValid && bestLap && !isBest && lap.duration_ms > 0
                           ? formatDelta(lap.duration_ms - bestLap.duration_ms)
                           : null;
                       return (
@@ -1524,15 +1576,32 @@ function Index() {
                                 <span className="size-1.5 rounded-full bg-accent" />
                               )}
                               L{lap.lap_number}
+                              {!isValid && (
+                                <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70 font-normal">
+                                  (incomplete)
+                                </span>
+                              )}
                             </div>
                           </td>
-                          <td className={isBest ? "text-accent font-semibold" : ""}>
+                          <td
+                            className={
+                              isBest
+                                ? "text-accent font-semibold"
+                                : !isValid
+                                  ? "text-muted-foreground/60 line-through"
+                                  : ""
+                            }
+                          >
                             {formatLapTime(lap.duration_ms)}
                           </td>
                           <td>
                             {isBest ? (
-                              <span className="rounded bg-accent px-2 py-0.5 text-xs text-accent-foreground">
+                              <span className="rounded bg-accent px-2 py-0.5 text-xs text-accent-foreground font-semibold">
                                 BEST
+                              </span>
+                            ) : !isValid ? (
+                              <span className="rounded bg-destructive/15 px-2 py-0.5 text-xs font-semibold text-destructive">
+                                INVALID
                               </span>
                             ) : (
                               <span className="text-muted-foreground">

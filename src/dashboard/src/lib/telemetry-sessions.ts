@@ -32,6 +32,7 @@ export type ApiLap = {
   avg_speed_kmh: number;
   max_g_lat: number;
   max_g_brake: number;
+  is_valid?: boolean | number;
 };
 
 export type TelemetryPoint = {
@@ -165,6 +166,56 @@ export function formatDelta(ms: number): string {
   const secs = Math.floor(abs / 1000);
   const millis = abs % 1000;
   return `${sign}${secs}.${String(millis).padStart(3, "0")}s`;
+}
+
+/**
+ * Evaluates whether a lap is complete and valid.
+ * An incomplete or aborted lap (e.g. session stopped prematurely after a few seconds)
+ * is considered invalid and must not be selected as the best lap nor shown in "Valid only".
+ */
+export function isLapValid(
+  lap: ApiLap,
+  allLaps?: ApiLap[],
+  telemetryPoints?: TelemetryPoint[],
+): boolean {
+  // 1. Explicit invalid flag from backend if present
+  if (lap.is_valid === false || (lap as any).is_valid === 0) {
+    return false;
+  }
+
+  // 2. Minimum duration requirement:
+  // Any real circuit lap requires at least 15 seconds (15,000 ms).
+  if (!lap.duration_ms || lap.duration_ms < 15000) {
+    return false;
+  }
+
+  // 3. Telemetry point count check if telemetry is loaded
+  if (telemetryPoints && telemetryPoints.length > 0) {
+    const lapPts = telemetryPoints.filter(
+      (p) => p.lap_id === lap.lap_id || p.lap_number === lap.lap_number,
+    );
+    // If telemetry is present for the session and this lap has fewer than 25 points (~1-2 seconds), it's incomplete
+    if (lapPts.length > 0 && lapPts.length < 25) {
+      return false;
+    }
+  }
+
+  // 4. Relative duration check vs other laps in the session:
+  // An aborted/incomplete lap will be less than 50% of the fastest candidate lap.
+  if (allLaps && allLaps.length > 1) {
+    const candidateDurations = allLaps
+      .filter((l) => l.duration_ms && l.duration_ms >= 15000)
+      .map((l) => l.duration_ms);
+
+    if (candidateDurations.length > 0) {
+      const minDuration = Math.min(...candidateDurations);
+      if (lap.duration_ms < minDuration * 0.5) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 /** Map speed to a colour: green (fast) → yellow → red (slow/braking) */
