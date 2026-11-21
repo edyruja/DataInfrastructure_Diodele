@@ -11,7 +11,7 @@ import {
   Platform,
 } from 'react-native';
 import * as Location from 'expo-location';
-import { Accelerometer, Gyroscope } from 'expo-sensors';
+import { DeviceMotion, Gyroscope } from 'expo-sensors';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
 const BASE_WS_URL = 'wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws';
@@ -122,16 +122,50 @@ export default function App() {
         latestGyro.current = gyro;
       });
 
-      Accelerometer.setUpdateInterval(10);
-      accelSub = Accelerometer.addListener((accel) => {
-        if (!isCalibrated.current) {
-          calibrationOffset.current = { x: accel.x, y: accel.y, z: accel.z };
-          isCalibrated.current = true;
-        }
+      DeviceMotion.setUpdateInterval(10);
+      accelSub = DeviceMotion.addListener((motion) => {
+        if (!motion) return;
 
-        const calX = accel.x - calibrationOffset.current.x;
-        const calY = accel.y - calibrationOffset.current.y;
-        const calZ = accel.z - calibrationOffset.current.z;
+        let calX = 0;
+        let calY = 0;
+        let calZ = 0;
+        const G_CONST = 9.80665;
+
+        if (motion.acceleration && motion.accelerationIncludingGravity) {
+          // 1. Vectorul de gravitație (Sensor.TYPE_GRAVITY calculat prin fuziune hardware)
+          const gx = motion.accelerationIncludingGravity.x - motion.acceleration.x;
+          const gy = motion.accelerationIncludingGravity.y - motion.acceleration.y;
+          const gz = motion.accelerationIncludingGravity.z - motion.acceleration.z;
+          const gNorm = Math.sqrt(gx * gx + gy * gy + gz * gz) || G_CONST;
+
+          // Direcția verticală reală (vector unitar)
+          const upX = gx / gNorm;
+          const upY = gy / gNorm;
+          const upZ = gz / gNorm;
+
+          // 2. Accelerația liniară (Sensor.TYPE_LINEAR_ACCELERATION) în m/s²
+          const ax = motion.acceleration.x || 0;
+          const ay = motion.acceleration.y || 0;
+          const az = motion.acceleration.z || 0;
+
+          // 3. Proiecția pe verticală (hopuri, denivelări pe axa gravitației)
+          const aVertical = ax * upX + ay * upY + az * upZ;
+
+          // 4. Proiecția pe planul orizontal (doar forțele dinamice ale mașinii: accelerație, frânare, viraje)
+          const axHoriz = ax - aVertical * upX;
+          const ayHoriz = ay - aVertical * upY;
+          const azHoriz = az - aVertical * upZ;
+
+          // 5. Convertire din m/s² în G (împărțire la 9.80665)
+          calX = axHoriz / G_CONST;
+          calY = ayHoriz / G_CONST;
+          calZ = azHoriz / G_CONST;
+        } else if (motion.accelerationIncludingGravity) {
+          // Fallback dacă senzorul liniar nu e disponibil instant
+          calX = (motion.accelerationIncludingGravity.x || 0) / G_CONST;
+          calY = (motion.accelerationIncludingGravity.y || 0) / G_CONST;
+          calZ = (motion.accelerationIncludingGravity.z || 0) / G_CONST;
+        }
 
         imuBuffer.current.push({
           ts: Date.now(),
