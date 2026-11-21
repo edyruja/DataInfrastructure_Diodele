@@ -5,10 +5,10 @@ variable "cloudflare_account_id" {
 }
 
 variable "cloudflare_api_token" {
-  description = "API Token-ul Cloudflare cu permisiuni de administrare D1 și Workers"
+  description = "Token Cloudflare cu permisiuni D1 Edit, Workers Scripts Edit și Queues Edit. Providerul poate citi și CLOUDFLARE_API_TOKEN."
   type        = string
   sensitive   = true
-  default     = ""
+  default     = null
 }
 
 variable "d1_database_name" {
@@ -24,7 +24,31 @@ variable "backend_worker_name" {
 }
 
 variable "dashboard_worker_name" {
-  description = "Numele worker-ului / proiectului Cloudflare pentru Dashboard (cu 12)"
+  description = "Numele Cloudflare Worker-ului care publică dashboard-ul"
   type        = string
   default     = "datainfrastructure-diodele12"
+}
+
+variable "workers_dev_subdomain" {
+  description = "Subdomeniul workers.dev înregistrat pentru contul Cloudflare"
+  type        = string
+  default     = "cristianstefanpopa05"
+}
+
+variable "telemetry_queue_name" {
+  description = "Numele cozii Cloudflare pentru mesajele de telemetrie"
+  type        = string
+  default     = "telemetry-queue"
+}
+
+variable "manage_queue_consumer" {
+  description = "Creează consumatorul cozii în Terraform. Pentru un consumator existent gestionat din Wrangler, setează false."
+  type        = bool
+  default     = true
+}
+
+variable "migrate_legacy_telemetry_hub" {
+  description = "Aplică migrarea TelemetryHub de la v1 la v2 pentru un Worker existent aflat la v1"
+  type        = bool
+  default     = false
 }

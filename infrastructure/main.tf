@@ -1,57 +1,58 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    cloudflare = {
-      source  = "cloudflare/cloudflare"
-      version = "~> 4.0"
-    }
-  }
-}
-
-provider "cloudflare" {
-  api_token = var.cloudflare_api_token
-}
-
-# 1. Baza de date Cloudflare D1 pentru stocarea telemetriei F1
 resource "cloudflare_d1_database" "telemetry_db" {
   account_id = var.cloudflare_account_id
   name       = var.d1_database_name
 }
 
-# 2. Worker-ul Cloudflare de Backend (Telemetrie F1: datainfrastructure-diodele)
-# Încarcă index.js unificat din src/backend/src/index.js (self-contained)
-resource "cloudflare_workers_script" "telemetry_worker" {
+resource "cloudflare_queue" "telemetry_queue" {
   account_id = var.cloudflare_account_id
-  name       = var.backend_worker_name
-  content    = file("${path.module}/../src/backend/src/index.js")
-  module     = true
+  queue_name = var.telemetry_queue_name
+}
 
-  compatibility_date  = "2026-01-01"
-  compatibility_flags = ["nodejs_compat"]
+resource "cloudflare_workers_script" "telemetry_worker" {
+  account_id         = var.cloudflare_account_id
+  script_name        = var.backend_worker_name
+  main_module        = "index.js"
+  content            = file("${path.module}/../src/backend/src/index.js")
+  compatibility_date = "2026-01-01"
 
-  # Leagă automat baza D1 de variabila "DB" din Worker
-  d1_database_binding {
-    name        = "DB"
-    database_id = cloudflare_d1_database.telemetry_db.id
+  bindings = [
+    {
+      name = "DB"
+      type = "d1"
+      id   = cloudflare_d1_database.telemetry_db.id
+    },
+    {
+      name       = "TELEMETRY_QUEUE"
+      type       = "queue"
+      queue_name = cloudflare_queue.telemetry_queue.queue_name
+    },
+  ]
+
+  migrations = var.migrate_legacy_telemetry_hub ? {
+    old_tag         = "v1"
+    new_tag         = "v2"
+    deleted_classes = ["TelemetryHub"]
+  } : null
+}
+
+resource "cloudflare_queue_consumer" "telemetry_consumer" {
+  count = var.manage_queue_consumer ? 1 : 0
+
+  account_id  = var.cloudflare_account_id
+  queue_id    = cloudflare_queue.telemetry_queue.id
+  script_name = cloudflare_workers_script.telemetry_worker.script_name
+  type        = "worker"
+
+  settings = {
+    batch_size       = 50
+    max_wait_time_ms = 1000
   }
 }
 
-# 3. Proiectul Cloudflare Pages / Worker pentru Dashboard (cu 12: datainfrastructure-diodele12)
-resource "cloudflare_pages_project" "dashboard_pages" {
-  account_id        = var.cloudflare_account_id
-  name              = var.dashboard_worker_name
-  production_branch = "main"
+resource "cloudflare_workers_script_subdomain" "telemetry_worker" {
+  account_id  = var.cloudflare_account_id
+  script_name = cloudflare_workers_script.telemetry_worker.script_name
+  enabled     = true
 
-  build_config {
-    build_command   = "npm run build"
-    destination_dir = ".output/public"
-    root_dir        = "src/dashboard"
-  }
-
-  deployment_configs {
-    production {
-      compatibility_date  = "2026-01-01"
-      compatibility_flags = ["nodejs_compat"]
-    }
-  }
+  depends_on = [cloudflare_queue_consumer.telemetry_consumer]
 }
