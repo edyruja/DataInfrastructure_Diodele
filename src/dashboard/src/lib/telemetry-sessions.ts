@@ -407,6 +407,116 @@ export function interpolateTelemetryPoint(
   };
 }
 
+export type GpsWaypoint = {
+  timeMs: number;
+  lat: number;
+  lon: number;
+  speed_kmh: number;
+};
+
+/**
+ * Extracts clean, distinct GPS waypoints from telemetry points.
+ * Eliminates duplicate/frozen GPS coordinates caused by sensor chunking,
+ * ensuring continuous 60 FPS interpolation without pauses or teleportation.
+ */
+export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
+  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
+  if (!valid.length) return [];
+
+  const waypoints: GpsWaypoint[] = [];
+
+  for (let i = 0; i < valid.length; i++) {
+    const p = valid[i]!;
+    if (waypoints.length === 0) {
+      waypoints.push({
+        timeMs: p.lap_offset_ms,
+        lat: p.lat,
+        lon: p.lon,
+        speed_kmh: p.speed_kmh,
+      });
+      continue;
+    }
+
+    const last = waypoints[waypoints.length - 1]!;
+    const dist = haversineMeters(last.lat, last.lon, p.lat, p.lon);
+    const dt = p.lap_offset_ms - last.timeMs;
+
+    // Record as new waypoint if vehicle moved (>= 0.6m) or stationary interval passed (> 400ms)
+    // or if it's the very last point
+    if (dist >= 0.6 || (p.speed_kmh === 0 && dt > 400) || i === valid.length - 1) {
+      const timeMs = dt > 0 ? p.lap_offset_ms : last.timeMs + 10;
+      waypoints.push({
+        timeMs,
+        lat: p.lat,
+        lon: p.lon,
+        speed_kmh: p.speed_kmh,
+      });
+    }
+  }
+
+  return waypoints;
+}
+
+/**
+ * Smooth 60 FPS Track Position Interpolator
+ * Returns the exact (lat, lon, speed) along the continuous circuit path at any timeMs.
+ */
+export function interpolateTrackPosition(
+  waypoints: GpsWaypoint[],
+  timeMs: number,
+): { lat: number; lon: number; speed_kmh: number; index: number; alpha: number } | null {
+  if (!waypoints || waypoints.length === 0) return null;
+
+  const first = waypoints[0]!;
+  if (waypoints.length === 1 || timeMs <= first.timeMs) {
+    return {
+      lat: first.lat,
+      lon: first.lon,
+      speed_kmh: first.speed_kmh,
+      index: 0,
+      alpha: 0,
+    };
+  }
+
+  const last = waypoints[waypoints.length - 1]!;
+  if (timeMs >= last.timeMs) {
+    return {
+      lat: last.lat,
+      lon: last.lon,
+      speed_kmh: last.speed_kmh,
+      index: waypoints.length - 1,
+      alpha: 1,
+    };
+  }
+
+  // Binary search for segment: waypoints[idx].timeMs <= timeMs
+  let low = 0;
+  let high = waypoints.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (waypoints[mid]!.timeMs <= timeMs) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const idx = Math.max(0, Math.min(waypoints.length - 2, high));
+  const w0 = waypoints[idx]!;
+  const w1 = waypoints[idx + 1]!;
+
+  const span = w1.timeMs - w0.timeMs;
+  const alpha = span > 0 ? Math.max(0, Math.min(1, (timeMs - w0.timeMs) / span)) : 0;
+
+  return {
+    lat: w0.lat + (w1.lat - w0.lat) * alpha,
+    lon: w0.lon + (w1.lon - w0.lon) * alpha,
+    speed_kmh: Number((w0.speed_kmh + (w1.speed_kmh - w0.speed_kmh) * alpha).toFixed(1)),
+    index: idx,
+    alpha,
+  };
+}
+
 /**
  * Snaps a 2D point (x, y) onto the closest segment of a reference track polyline.
  * If distance is within maxCorridorPx, snaps directly to the centerline.
