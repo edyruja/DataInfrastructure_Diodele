@@ -245,6 +245,11 @@ export type Projected = {
   y: number;
   speed: number;
   apex: 0 | 1;
+  g_lat?: number;
+  g_lon?: number;
+  lat?: number;
+  lon?: number;
+  timeMs?: number;
 };
 
 export type TrackBounds = {
@@ -341,7 +346,16 @@ export function projectCoordWithBounds(
 }
 
 export function projectPoints(
-  points: TelemetryPoint[],
+  points: Array<{
+    lat: number;
+    lon: number;
+    speed_kmh: number;
+    is_corner_apex?: 0 | 1;
+    g_lat?: number;
+    g_lon?: number;
+    timeMs?: number;
+    lap_offset_ms?: number;
+  }>,
   w = 400,
   h = 220,
   pad = 24,
@@ -359,7 +373,12 @@ export function projectPoints(
       x,
       y,
       speed: p.speed_kmh,
-      apex: p.is_corner_apex,
+      apex: p.is_corner_apex ?? 0,
+      g_lat: p.g_lat ?? 0,
+      g_lon: p.g_lon ?? 0,
+      lat: p.lat,
+      lon: p.lon,
+      timeMs: p.timeMs ?? p.lap_offset_ms,
     };
   });
 }
@@ -463,6 +482,8 @@ export type GpsWaypoint = {
   lat: number;
   lon: number;
   speed_kmh: number;
+  g_lat: number;
+  g_lon: number;
 };
 
 /**
@@ -484,6 +505,8 @@ export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
         lat: p.lat,
         lon: p.lon,
         speed_kmh: p.speed_kmh,
+        g_lat: p.g_lat,
+        g_lon: p.g_lon,
       });
       continue;
     }
@@ -501,6 +524,8 @@ export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
         lat: p.lat,
         lon: p.lon,
         speed_kmh: p.speed_kmh,
+        g_lat: p.g_lat,
+        g_lon: p.g_lon,
       });
     }
   }

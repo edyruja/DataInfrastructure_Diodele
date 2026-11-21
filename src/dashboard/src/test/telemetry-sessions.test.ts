@@ -265,4 +265,18 @@ describe("isLapValid and Best Lap Selection", () => {
     const deltaMs = l1.duration_ms - best.duration_ms;
     expect(formatDelta(deltaMs)).toBe("+6.919s");
   });
+
+  it("preserves g_lat and g_lon in projected points for circuit hover synchronization", () => {
+    const pts = [
+      { lat: 46.7800, lon: 23.6100, speed_kmh: 55, g_lat: 0.85, g_lon: -0.45 },
+      { lat: 46.7810, lon: 23.6110, speed_kmh: 60, g_lat: -0.62, g_lon: 0.30 },
+    ];
+    const projected = projectPoints(pts);
+    expect(projected.length).toBe(2);
+    expect(projected[0]!.g_lat).toBe(0.85);
+    expect(projected[0]!.g_lon).toBe(-0.45);
+    expect(projected[0]!.speed).toBe(55);
+    expect(projected[1]!.g_lat).toBe(-0.62);
+    expect(projected[1]!.g_lon).toBe(0.30);
+  });
 });
