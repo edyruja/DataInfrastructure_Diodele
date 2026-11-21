@@ -129,6 +129,23 @@ export default function App() {
       pointsSentCounter.current = 0;
       simStepRef.current = 0;
 
+      // Dacă e mod simulator, inițializăm GPS cu primul waypoint ÎNAINTE de connect
+      // astfel primul batch trimis are speed corect (nu 0)
+      if (isSimulatorModeRef.current) {
+        const wp0 = SIM_TRACK_WAYPOINTS[0];
+        const wp1 = SIM_TRACK_WAYPOINTS[1];
+        const dLon0 = wp1.lon - wp0.lon;
+        const y0 = Math.sin(dLon0) * Math.cos(wp1.lat);
+        const x0 = Math.cos(wp0.lat) * Math.sin(wp1.lat) - Math.sin(wp0.lat) * Math.cos(wp1.lat) * Math.cos(dLon0);
+        const initBearing = (Math.atan2(y0, x0) * (180 / Math.PI) + 360) % 360;
+        latestGps.current = {
+          lat: wp0.lat,
+          lon: wp0.lon,
+          speed: wp0.speed / 3.6, // km/h → m/s
+          bearing: initBearing,
+        };
+      }
+
       connectWebSocket();
 
       if (isSimulatorModeRef.current) {
