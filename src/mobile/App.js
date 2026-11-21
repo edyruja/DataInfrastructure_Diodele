@@ -14,7 +14,7 @@ import * as Location from 'expo-location';
 import { DeviceMotion, Gyroscope } from 'expo-sensors';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
-const BASE_WS_URL = 'wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws';
+const BASE_API_URL = 'https://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/api/telemetry';
 
 export default function App() {
   const [driverName, setDriverName] = useState('Alex - S23');
@@ -22,7 +22,6 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [statusText, setStatusText] = useState('Pregătit');
 
-  const ws = useRef(null);
   const isRunningRef = useRef(false);
   const imuBuffer = useRef([]);
   const retryQueue = useRef([]);
@@ -38,50 +37,27 @@ export default function App() {
     let accelSub = null;
     let gyroSub = null;
     let sendInterval = null;
-    let reconnectTimeout = null;
 
-    const flushRetryQueue = () => {
-      while (retryQueue.current.length > 0 && ws.current && ws.current.readyState === WebSocket.OPEN) {
-        const queued = retryQueue.current.shift();
-        try {
-          ws.current.send(JSON.stringify(queued));
-        } catch (err) {
-          retryQueue.current.unshift(queued);
-          break;
+    const sendBatchHttp = async (batchPayload) => {
+      try {
+        const response = await fetch(BASE_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(batchPayload),
+        });
+
+        if (response.ok || response.status === 202) {
+          if (isRunningRef.current) {
+            setStatusText('● ONLINE - Transmisie HTTP Queue');
+          }
+          return true;
         }
+        return false;
+      } catch (err) {
+        return false;
       }
-    };
-
-    const connectWebSocket = () => {
-      if (!isRunningRef.current) return;
-
-      const cleanTrack = encodeURIComponent(trackName.trim() || 'Default-Track');
-      const cleanDriver = encodeURIComponent(driverName.trim() || 'S23-Driver');
-      const fullUrl = `${BASE_WS_URL}?session=${sessionIdRef.current}&track=${cleanTrack}&device=${cleanDriver}`;
-
-      setStatusText('Conectare la Cloud...');
-      ws.current = new WebSocket(fullUrl);
-
-      ws.current.onopen = () => {
-        setStatusText('● LIVE - Se înregistrează');
-        flushRetryQueue();
-      };
-
-      ws.current.onerror = () => {
-        setStatusText('Reconectare...');
-      };
-
-      ws.current.onclose = () => {
-        if (isRunningRef.current) {
-          const qCount = retryQueue.current.length;
-          setStatusText(
-            qCount > 0
-              ? `Buffer offline (${qCount}) - Reconectare...`
-              : 'Semnal slab - Reconectare...'
-          );
-          reconnectTimeout = setTimeout(connectWebSocket, 1000);
-        }
-      };
     };
 
     const startTelemetry = async () => {
@@ -98,8 +74,7 @@ export default function App() {
       imuBuffer.current = [];
       retryQueue.current = [];
       isCalibrated.current = false;
-
-      connectWebSocket();
+      setStatusText('● ONLINE - Transmisie HTTP Queue');
 
       locSub = await Location.watchPositionAsync(
         {
@@ -211,54 +186,57 @@ export default function App() {
           };
         }
 
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          flushRetryQueue();
-          if (payload) {
-            try {
-              ws.current.send(JSON.stringify(payload));
-            } catch (err) {
-              retryQueue.current.push(payload);
+        // 1. Drenăm din coada locală de retry dacă există elemente restante
+        if (retryQueue.current.length > 0) {
+          const queued = retryQueue.current[0];
+          sendBatchHttp(queued).then((ok) => {
+            if (ok) {
+              retryQueue.current.shift();
             }
-          }
-        } else if (payload) {
-          retryQueue.current.push(payload);
-          if (retryQueue.current.length > 300) {
-            retryQueue.current.shift();
-          }
-          if (isRunningRef.current) {
-            setStatusText(`Buffer offline (${retryQueue.current.length}) - Reconectare...`);
-          }
+          });
+        }
+
+        // 2. Expediem pachetul curent către Cloudflare Queue via HTTP POST
+        if (payload) {
+          sendBatchHttp(payload).then((ok) => {
+            if (!ok) {
+              retryQueue.current.push(payload);
+              if (retryQueue.current.length > 300) {
+                retryQueue.current.shift();
+              }
+              if (isRunningRef.current) {
+                setStatusText(`Buffer offline (${retryQueue.current.length}) - Reconectare...`);
+              }
+            }
+          });
         }
       }, 200);
     };
 
     const stopTelemetry = () => {
+      if (!sessionIdRef.current) {
+        setStatusText('Pregătit');
+        return;
+      }
+
       const stopPayload = {
         session_id: sessionIdRef.current,
         device_id: driverName.trim() || 'S23-Driver',
+        track_name: trackName.trim() || 'Default-Track',
         event_type: 'STOP_SESSION',
         timestamp: new Date().toISOString(),
         unit: 'event',
         value: 'session_completed',
       };
 
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        flushRetryQueue();
-        try {
-          ws.current.send(JSON.stringify(stopPayload));
-        } catch (e) {
-          console.warn('Failed to send STOP_SESSION', e);
-        }
-        ws.current.close();
-      } else {
-        if (ws.current) ws.current.close();
-      }
+      fetch(BASE_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(stopPayload),
+      }).catch((e) => console.warn('Failed to send STOP_SESSION', e));
+
       deactivateKeepAwake();
-      if (sessionIdRef.current) {
-        setStatusText('Sesiune salvată în Cloud');
-      } else {
-        setStatusText('Pregătit');
-      }
+      setStatusText('Sesiune salvată în Cloud (Queue)');
     };
 
     if (isRunning) {
@@ -272,8 +250,6 @@ export default function App() {
       if (accelSub) accelSub.remove();
       if (gyroSub) gyroSub.remove();
       if (sendInterval) clearInterval(sendInterval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (ws.current) ws.current.close();
       deactivateKeepAwake();
     };
   }, [isRunning]);

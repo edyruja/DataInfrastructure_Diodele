@@ -1,6 +1,7 @@
 name = "datainfrastructure-diodele"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
+account_id = "dfe48fe11d5dfc0dc30a84dab037aff9"
 
 [[d1_databases]]
 binding = "DB"
@@ -17,3 +18,12 @@ queue = "telemetry-queue"
 queue = "telemetry-queue"
 max_batch_size = 50
 max_batch_timeout = 1
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TelemetryHub"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["TelemetryHub"]
+
