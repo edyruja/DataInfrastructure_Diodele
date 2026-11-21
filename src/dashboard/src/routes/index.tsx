@@ -560,32 +560,6 @@ function Index() {
     return interpolateTelemetryPoint(displayedTelemetry, baseTimeMs + replayTimeMs);
   }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
 
-  // Exact recorded 20 Hz telemetry point for G-G diagram (takes direct values without synthetic blending)
-  const currentReplayPoint = useMemo(() => {
-    if (!isReplaying || replayTimeMs === null || displayedTelemetry.length === 0) return null;
-    const targetMs = baseTimeMs + replayTimeMs;
-
-    // Binary search: găsim exact punctul din baza de date corespunzător milisecundei curente
-    let low = 0;
-    let high = displayedTelemetry.length - 1;
-    while (low <= high) {
-      const mid = (low + high) >> 1;
-      if (displayedTelemetry[mid]!.lap_offset_ms <= targetMs) {
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    const idx = Math.max(0, Math.min(displayedTelemetry.length - 1, high));
-    const pt = displayedTelemetry[idx]!;
-    return {
-      ...pt,
-      index: idx,
-      timeMs: pt.lap_offset_ms,
-      total_g: Number(Math.hypot(pt.g_lat, pt.g_lon).toFixed(2)),
-    };
-  }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
-
   // ── Reference Track: the established circuit path ────────────────────────
   // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
   // From Lap 2 onwards (or for recorded sessions), referenceTrack holds Lap 1 points (the circuit layout).
@@ -812,6 +786,28 @@ function Index() {
     referenceTrack.length,
   ]);
 
+  // ── Exact Replay Point for G-G diagram: sampled from smoothFullTrack using IDENTICAL logic to hoveredPoint (white dot) ──
+  const replayTrackPoint = useMemo(() => {
+    if (!isReplaying || !carDot) return null;
+    const trackSource = smoothFullTrack.length > 0 ? smoothFullTrack : fullProjectedTrack;
+    if (trackSource.length === 0) return null;
+
+    let closest: Projected | null = null;
+    let minDistanceSq = Infinity;
+
+    for (let i = 0; i < trackSource.length; i++) {
+      const pt = trackSource[i]!;
+      const dx = pt.x - carDot.x;
+      const dy = pt.y - carDot.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < minDistanceSq) {
+        minDistanceSq = d2;
+        closest = pt;
+      }
+    }
+    return closest;
+  }, [isReplaying, carDot, smoothFullTrack, fullProjectedTrack]);
+
   // Dynamic speed trace polyline:
   // - In Replay Mode: evolves dynamically at 60 FPS up to the replay car position, smoothed with spline.
   // - In Live Mode on Lap 2+: renders ONLY the colored trace for current lap behind the moving car.
@@ -935,27 +931,21 @@ function Index() {
 
   const currentGLat = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0)
-    : isReplaying && currentReplayPoint
-      ? currentReplayPoint.g_lat
-      : isReplaying && currentReplayFrame
-        ? currentReplayFrame.g_lat
-        : maxGLat;
+    : isReplaying && replayTrackPoint
+      ? (replayTrackPoint.g_lat ?? 0)
+      : maxGLat;
 
   const currentGLon = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0)
-    : isReplaying && currentReplayPoint
-      ? currentReplayPoint.g_lon
-      : isReplaying && currentReplayFrame
-        ? currentReplayFrame.g_lon
-        : -maxGBrake;
+    : isReplaying && replayTrackPoint
+      ? (replayTrackPoint.g_lon ?? 0)
+      : -maxGBrake;
 
   const totalG = isCurrentSessionLive
     ? (liveInterpolatedFrame?.total_g ?? liveSessionState?.totalG ?? 0)
-    : isReplaying && currentReplayPoint
-      ? Number(Math.hypot(currentReplayPoint.g_lat, currentReplayPoint.g_lon).toFixed(2))
-      : isReplaying && currentReplayFrame
-        ? currentReplayFrame.total_g
-        : 0;
+    : isReplaying && replayTrackPoint
+      ? Number(Math.hypot(replayTrackPoint.g_lat ?? 0, replayTrackPoint.g_lon ?? 0).toFixed(2))
+      : 0;
 
   // Active zoom level on G-G Diagram
   const currentGZoom = G_ZOOM_LEVELS[gZoomIndex] ?? G_ZOOM_LEVELS[0];
@@ -991,9 +981,10 @@ function Index() {
 
   // G-G scatter: in Replay mode, shows points appearing sequentially up to current timestamp!
   const gSample = useMemo(() => {
-    if (isReplaying && currentReplayPoint) {
+    if (isReplaying && replayTimeMs !== null) {
+      const targetMs = baseTimeMs + replayTimeMs;
       const upToNow = displayedTelemetry.filter(
-        (p) => p.lap_offset_ms <= currentReplayPoint.timeMs,
+        (p) => p.lap_offset_ms <= targetMs,
       );
       if (upToNow.length <= 150) return upToNow;
       const step = Math.ceil(upToNow.length / 150);
@@ -1003,7 +994,7 @@ function Index() {
     if (source.length <= 150) return source;
     const step = Math.ceil(source.length / 150);
     return source.filter((_, i) => i % step === 0);
-  }, [isReplaying, currentReplayPoint, isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
+  }, [isReplaying, replayTimeMs, baseTimeMs, isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
   // KPI cards
   const kpis = [
@@ -1037,8 +1028,8 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${(liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0).toFixed(2)} G`
-        : isReplaying && currentReplayPoint
-          ? `Current: ${currentReplayPoint.g_lat.toFixed(2)} G`
+        : isReplaying && replayTrackPoint
+          ? `Current: ${(replayTrackPoint.g_lat ?? 0).toFixed(2)} G`
           : "Session max",
     },
     {
@@ -1047,8 +1038,8 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${Math.abs(liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0).toFixed(2)} G`
-        : isReplaying && currentReplayPoint
-          ? `Current: ${Math.abs(currentReplayPoint.g_lon).toFixed(2)} G`
+        : isReplaying && replayTrackPoint
+          ? `Current: ${Math.abs(replayTrackPoint.g_lon ?? 0).toFixed(2)} G`
           : "Session max",
       negative: true,
     },
