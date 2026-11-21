@@ -1,6 +1,6 @@
 // API_BASE_URL and WS_LIVE_URL are defined in @/lib/telemetry-sessions
 import { createFileRoute } from "@tanstack/react-router";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import car from "@/assets/gt2rs-side.png";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,19 +11,27 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { RefreshCw } from "lucide-react";
 import {
   type ApiSession,
   type ApiLap,
   type TelemetryPoint,
   type LiveFrame,
   type WsMessage,
+  type Projected,
   WS_LIVE_URL,
   fetchSessions,
   fetchLaps,
   fetchTelemetry,
   formatLapTime,
   formatDelta,
+  formatSessionDateTime,
   speedColor,
+  computeTrackBounds,
+  projectPoints,
+  projectCoordWithBounds,
+  snapPointToPolyline,
+  haversineMeters,
 } from "@/lib/telemetry-sessions";
 
 // ---------------------------------------------------------------------------
@@ -50,50 +58,52 @@ export const Route = createFileRoute("/")({
 });
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-type Projected = { x: number; y: number; speed: number; apex: 0 | 1 };
-
-function projectPoints(
-  points: TelemetryPoint[],
-  w = 400,
-  h = 220,
-  pad = 20,
-): Projected[] {
-  if (!points.length) return [];
-  const lats = points.map((p) => p.lat);
-  const lons = points.map((p) => p.lon);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const minLon = Math.min(...lons);
-  const maxLon = Math.max(...lons);
-  const rangeX = maxLon - minLon || 1;
-  const rangeY = maxLat - minLat || 1;
-  const scale = Math.min((w - 2 * pad) / rangeX, (h - 2 * pad) / rangeY);
-  return points.map((p) => ({
-    x: pad + (p.lon - minLon) * scale,
-    y: h - pad - (p.lat - minLat) * scale,
-    speed: p.speed_kmh,
-    apex: p.is_corner_apex,
-  }));
-}
-
-// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 function Index() {
   const [sessions, setSessions] = useState<ApiSession[]>([]);
   const [sessionId, setSessionId] = useState<string>("");
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+
   const [laps, setLaps] = useState<ApiLap[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
+  const [liveTrackPoints, setLiveTrackPoints] = useState<TelemetryPoint[]>([]);
+  const [selectedLapId, setSelectedLapId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
   const [liveFrame, setLiveFrame] = useState<LiveFrame | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [validOnly, setValidOnly] = useState(false);
-  const [loading, setLoading] = useState(true);
+
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastLapRef = useRef<number>(1);
+
+  // ── Load sessions from database ──────────────────────────────────────────
+  const loadSessions = useCallback(async (selectFirst = false) => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      const data = await fetchSessions();
+      setSessions(data);
+      const first = data[0];
+      if (first) {
+        setSessionId((prev) => {
+          if (!prev || selectFirst || !data.some((s) => s.session_id === prev)) {
+            return first.session_id;
+          }
+          return prev;
+        });
+      }
+    } catch (err) {
+      console.error("fetchSessions error:", err);
+      setSessionsError(err instanceof Error ? err.message : "Error fetching sessions");
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, []);
 
   // ── WebSocket setup ──────────────────────────────────────────────────────
   const connectWs = useCallback(() => {
@@ -109,9 +119,66 @@ function Index() {
         if (msg.type === "LIVE_FRAME") {
           setLiveFrame(msg);
           setIsLive(true);
+
+          // If current lap advanced (lap 1 ended, lap 2 started), refresh laps from DB
+          if (msg.current_lap > lastLapRef.current) {
+            lastLapRef.current = msg.current_lap;
+            if (msg.session_id) {
+              fetchLaps(msg.session_id).then(setLaps).catch(() => {});
+            }
+          }
+
+          // Accumulate live GPS points
+          if (msg.frame.lat !== 0 && msg.frame.lon !== 0) {
+            const newPt: TelemetryPoint = {
+              lap_id: `${msg.session_id}_lap_${String(msg.current_lap).padStart(2, "0")}`,
+              lap_number: msg.current_lap,
+              lap_offset_ms: msg.current_lap_time_ms,
+              lat: msg.frame.lat,
+              lon: msg.frame.lon,
+              speed_kmh: msg.frame.speed_kmh,
+              bearing: 0,
+              g_lat: msg.frame.g_lat,
+              g_lon: msg.frame.g_lon,
+              is_corner_apex: msg.frame.is_corner_apex,
+            };
+
+            setLiveTrackPoints((prev) => {
+              const last = prev[prev.length - 1];
+              if (last) {
+                // Ignore micro stationary noise (< 1.2m and < 1.5 km/h)
+                const dist = haversineMeters(last.lat, last.lon, newPt.lat, newPt.lon);
+                if (dist < 1.2 && newPt.speed_kmh < 1.5) {
+                  return prev;
+                }
+              }
+              return [...prev, newPt];
+            });
+          }
+
+          // Ensure session is in the list
+          setSessions((prev) => {
+            if (!prev.some((s) => s.session_id === msg.session_id)) {
+              return [
+                {
+                  session_id: msg.session_id,
+                  device_id: msg.device_id,
+                  track_name: msg.track_name,
+                  created_at: new Date().toISOString(),
+                },
+                ...prev,
+              ];
+            }
+            return prev;
+          });
+        } else if (msg.type === "LAP_COMPLETED") {
+          if (msg.session_id) {
+            fetchLaps(msg.session_id).then(setLaps).catch(() => {});
+          }
         } else if (msg.type === "SESSION_ENDED") {
           setIsLive(false);
           setLiveFrame(null);
+          loadSessions();
         }
       } catch {
         // ignore malformed frames
@@ -128,110 +195,240 @@ function Index() {
 
     ws.onclose = scheduleRetry;
     ws.onerror = scheduleRetry;
-  }, []);
+  }, [loadSessions]);
 
-  // ── On mount: fetch sessions + open WS ───────────────────────────────────
+  // ── On mount: load sessions + open WS ─────────────────────────────────────
   useEffect(() => {
-    const ac = new AbortController();
-
-    fetchSessions(ac.signal)
-      .then((data) => {
-        setSessions(data);
-        const first = data[0];
-        if (first) setSessionId(first.session_id);
-      })
-      .catch(() => {/* ignore abort */});
-
+    loadSessions(true);
     connectWs();
 
     return () => {
-      ac.abort();
       wsRef.current?.close();
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     };
-  }, [connectWs]);
+  }, [loadSessions, connectWs]);
 
   // ── When sessionId changes: fetch laps + telemetry ───────────────────────
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      setLaps([]);
+      setTelemetry([]);
+      setLiveTrackPoints([]);
+      return;
+    }
     const ac = new AbortController();
     setLoading(true);
+    setSelectedLapId(null);
+    lastLapRef.current = 1;
 
     Promise.all([
-      fetchLaps(sessionId, ac.signal),
-      fetchTelemetry(sessionId, ac.signal),
+      fetchLaps(sessionId, ac.signal).catch((err) => {
+        console.warn("fetchLaps error:", err);
+        return [] as ApiLap[];
+      }),
+      fetchTelemetry(sessionId, ac.signal).catch((err) => {
+        console.warn("fetchTelemetry error:", err);
+        return [] as TelemetryPoint[];
+      }),
     ])
       .then(([lapData, telData]) => {
         setLaps(lapData);
         setTelemetry(telData);
+        setLiveTrackPoints(telData);
+        if (lapData.length > 0) {
+          lastLapRef.current = Math.max(...lapData.map((l) => l.lap_number));
+        }
       })
-      .catch(() => {/* ignore abort */})
       .finally(() => setLoading(false));
 
     return () => ac.abort();
   }, [sessionId]);
 
   // ── Computed values ───────────────────────────────────────────────────────
+  const isCurrentSessionLive = isLive && liveFrame?.session_id === sessionId;
+
+  // Active telemetry for recorded / filtered views
+  const displayedTelemetry = useMemo(() => {
+    if (!selectedLapId) return telemetry;
+    return telemetry.filter((p) => p.lap_id === selectedLapId);
+  }, [telemetry, selectedLapId]);
+
+  // ── Reference Track: the established circuit path ────────────────────────
+  // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
+  // From Lap 2 onwards (or for recorded sessions), referenceTrack holds Lap 1 points (the circuit layout).
+  const referenceTrack = useMemo(() => {
+    // 1. Recorded session from database:
+    if (!isCurrentSessionLive) {
+      if (telemetry.length === 0) return [];
+      if (selectedLapId) {
+        return telemetry.filter((p) => p.lap_id === selectedLapId);
+      }
+      const lap1 = telemetry.filter((p) => p.lap_number === 1);
+      return lap1.length > 8 ? lap1 : telemetry;
+    }
+
+    // 2. Live session:
+    // When Lap 1 is complete (current_lap >= 2 or completed laps exist):
+    const currentLiveLap = liveFrame?.current_lap ?? 1;
+    if (currentLiveLap >= 2 || laps.length > 0) {
+      const lap1Live = liveTrackPoints.filter((p) => p.lap_number === 1);
+      if (lap1Live.length > 8) return lap1Live;
+      const lap1Tel = telemetry.filter((p) => p.lap_number === 1);
+      if (lap1Tel.length > 8) return lap1Tel;
+    }
+
+    // Still in live Lap 1: no reference track yet (actively being created)
+    return [];
+  }, [isCurrentSessionLive, telemetry, selectedLapId, liveFrame?.current_lap, laps.length, liveTrackPoints]);
+
+  // Points used to render circuit geometry and compute bounds
+  const activeTrackPoints = useMemo(() => {
+    if (referenceTrack.length > 0) {
+      return referenceTrack;
+    }
+    // During live Lap 1: use the accumulated live points
+    if (isCurrentSessionLive) {
+      return liveTrackPoints.length > 0 ? liveTrackPoints : telemetry;
+    }
+    return telemetry;
+  }, [referenceTrack, isCurrentSessionLive, liveTrackPoints, telemetry]);
+
+  // Track bounding box (smooth auto-expansion during Lap 1, locked on Lap 2+)
+  const trackBounds = useMemo(() => {
+    return computeTrackBounds(activeTrackPoints);
+  }, [activeTrackPoints]);
+
+  // Projected track points inside SVG viewBox (400 x 220)
+  const projectedTrack = useMemo(() => {
+    return projectPoints(activeTrackPoints, 400, 220, 24, trackBounds);
+  }, [activeTrackPoints, trackBounds]);
+
+  const startPoint = projectedTrack.length > 0 ? projectedTrack[0] : null;
+  const isClosedLoop = useMemo(() => {
+    if (activeTrackPoints.length < 15) return false;
+    const first = activeTrackPoints[0]!;
+    const last = activeTrackPoints[activeTrackPoints.length - 1]!;
+    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 35;
+  }, [activeTrackPoints]);
+
+  const endPoint =
+    projectedTrack.length > 1 && !isClosedLoop
+      ? projectedTrack[projectedTrack.length - 1]
+      : null;
+
+  const mapMaxSpeed = useMemo(() => {
+    const list = isCurrentSessionLive ? liveTrackPoints : displayedTelemetry;
+    if (!list.length) return 1;
+    return Math.max(...list.map((p) => p.speed_kmh));
+  }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
+
+  // ── Live Car Dot with Track Snapping ─────────────────────────────────────
+  // Lap 1: Car dot is at the head of the trail being drawn live.
+  // Lap 2+: Car dot snaps onto the established reference track corridor so it never falls outside the track!
+  const carDot = useMemo(() => {
+    if (!isCurrentSessionLive || !liveFrame || projectedTrack.length === 0 || !trackBounds) {
+      return null;
+    }
+
+    // From Lap 2 onwards: Snap to established reference circuit track
+    if (referenceTrack.length > 0 && liveFrame.current_lap >= 2) {
+      const rawPos = projectCoordWithBounds(
+        liveFrame.frame.lat,
+        liveFrame.frame.lon,
+        trackBounds,
+        400,
+        220,
+        24,
+      );
+      // Snapping to the reference polyline within track corridor
+      const snapped = snapPointToPolyline(rawPos, projectedTrack, 45);
+      return {
+        x: snapped.x,
+        y: snapped.y,
+        speed: liveFrame.frame.speed_kmh,
+        segmentIndex: snapped.segmentIndex,
+        isSnapped: true,
+      };
+    }
+
+    // During live Lap 1: Car dot is at the head of the live path
+    const head = projectedTrack[projectedTrack.length - 1];
+    if (!head) return null;
+    return {
+      x: head.x,
+      y: head.y,
+      speed: liveFrame.frame.speed_kmh,
+      segmentIndex: projectedTrack.length - 1,
+      isSnapped: false,
+    };
+  }, [isCurrentSessionLive, liveFrame, projectedTrack, trackBounds, referenceTrack.length]);
+
+  // Overall points buffer for KPIs
+  const allPoints = isCurrentSessionLive ? liveTrackPoints : telemetry;
+
   const bestLap = laps.reduce<ApiLap | null>(
-    (b, l) => (!b || l.duration_ms < b.duration_ms ? l : b),
+    (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
     null,
   );
-  const maxSpeed = laps.length ? Math.max(...laps.map((l) => l.max_speed_kmh)) : 0;
-  const maxGLat  = laps.length ? Math.max(...laps.map((l) => l.max_g_lat))    : 0;
-  const maxGBrake = laps.length ? Math.max(...laps.map((l) => l.max_g_brake)) : 0;
-  const avgSpeed =
-    laps.length
-      ? laps.reduce((s, l) => s + l.avg_speed_kmh, 0) / laps.length
-      : 0;
 
-  const displaySpeed = liveFrame ? liveFrame.frame.speed_kmh : maxSpeed;
-  const gLat = liveFrame ? liveFrame.frame.g_lat : (bestLap?.max_g_lat ?? 0);
-  const gLon = liveFrame ? liveFrame.frame.g_lon : 0;
-  const totalG = liveFrame ? liveFrame.frame.total_g : 0;
+  const maxSpeed = useMemo(() => {
+    const liveSpeed = isCurrentSessionLive && liveFrame ? liveFrame.frame.speed_kmh : 0;
+    if (laps.length > 0) return Math.max(liveSpeed, ...laps.map((l) => l.max_speed_kmh));
+    if (allPoints.length > 0) return Math.max(liveSpeed, ...allPoints.map((p) => p.speed_kmh));
+    return liveSpeed;
+  }, [laps, allPoints, isCurrentSessionLive, liveFrame]);
+
+  const maxGLat = useMemo(() => {
+    const liveGLat = isCurrentSessionLive && liveFrame ? Math.abs(liveFrame.frame.g_lat) : 0;
+    if (laps.length > 0) return Math.max(liveGLat, ...laps.map((l) => l.max_g_lat));
+    if (allPoints.length > 0) return Math.max(liveGLat, ...allPoints.map((p) => Math.abs(p.g_lat)));
+    return liveGLat;
+  }, [laps, allPoints, isCurrentSessionLive, liveFrame]);
+
+  const maxGBrake = useMemo(() => {
+    const liveGBrake = isCurrentSessionLive && liveFrame ? Math.max(0, -liveFrame.frame.g_lon) : 0;
+    if (laps.length > 0) return Math.max(liveGBrake, ...laps.map((l) => l.max_g_brake));
+    if (allPoints.length > 0) return Math.max(liveGBrake, ...allPoints.map((p) => Math.max(0, -p.g_lon)));
+    return liveGBrake;
+  }, [laps, allPoints, isCurrentSessionLive, liveFrame]);
+
+  const avgSpeed = useMemo(() => {
+    if (laps.length > 0) {
+      const valid = laps.filter((l) => l.avg_speed_kmh > 0);
+      if (valid.length > 0) {
+        return valid.reduce((s, l) => s + l.avg_speed_kmh, 0) / valid.length;
+      }
+    }
+    if (allPoints.length > 0) {
+      return allPoints.reduce((s, p) => s + p.speed_kmh, 0) / allPoints.length;
+    }
+    return 0;
+  }, [laps, allPoints]);
+
+  const displaySpeed = isCurrentSessionLive && liveFrame ? liveFrame.frame.speed_kmh : maxSpeed;
+  const currentGLat = isCurrentSessionLive && liveFrame ? liveFrame.frame.g_lat : maxGLat;
+  const currentGLon = isCurrentSessionLive && liveFrame ? liveFrame.frame.g_lon : -maxGBrake;
+  const totalG = isCurrentSessionLive && liveFrame ? liveFrame.frame.total_g : 0;
 
   // SVG G-meter live dot position
-  const gx = 110 + gLat * 52;
-  const gy = 110 - gLon * 47;
+  const gx = 110 + (isCurrentSessionLive ? currentGLat : 0) * 52;
+  const gy = 110 - (isCurrentSessionLive ? currentGLon : 0) * 47;
 
   // Current session object
   const session = sessions.find((s) => s.session_id === sessionId);
 
-  // Visible laps (all | valid only)
-  const visibleLaps = validOnly ? laps.filter((l) => l.lap_number > 1) : laps;
+  // Visible laps (all | valid only: duration > 0 or lap > 1)
+  const visibleLaps = validOnly
+    ? laps.filter((l) => l.lap_number > 1 || l.duration_ms > 0)
+    : laps;
 
-  // Track map projection
-  const projected = projectPoints(telemetry);
-  const mapMaxSpeed = telemetry.length
-    ? Math.max(...telemetry.map((p) => p.speed_kmh))
-    : 1;
-
-  // Live position on map
-  let liveDot: Projected | null = null;
-  if (liveFrame && telemetry.length > 0) {
-    const pLat = liveFrame.frame.lat;
-    const pLon = liveFrame.frame.lon;
-    const fake = projectPoints([
-      ...telemetry,
-      {
-        lap_id: "",
-        lap_number: 0,
-        lap_offset_ms: 0,
-        lat: pLat,
-        lon: pLon,
-        speed_kmh: liveFrame.frame.speed_kmh,
-        bearing: 0,
-        g_lat: liveFrame.frame.g_lat,
-        g_lon: liveFrame.frame.g_lon,
-        is_corner_apex: 0,
-      },
-    ]);
-    liveDot = fake[fake.length - 1] ?? null;
-  }
-
-  // G-G scatter (sample up to 80 points)
-  const gSample = telemetry.length > 80
-    ? telemetry.filter((_, i) => i % Math.ceil(telemetry.length / 80) === 0)
-    : telemetry;
+  // G-G scatter (sample up to 150 points for rich distribution)
+  const gSample = useMemo(() => {
+    const source = isCurrentSessionLive ? liveTrackPoints : displayedTelemetry;
+    if (source.length <= 150) return source;
+    const step = Math.ceil(source.length / 150);
+    return source.filter((_, i) => i % step === 0);
+  }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
   // KPI cards
   const kpis = [
@@ -243,10 +440,10 @@ function Index() {
       highlight: true,
     },
     {
-      label: "Max speed",
+      label: isCurrentSessionLive ? "Live speed" : "Max speed",
       value: displaySpeed.toFixed(1),
       unit: "km/h",
-      sub: liveFrame ? "Live" : "Session max",
+      sub: isCurrentSessionLive ? "Live" : "Session peak",
     },
     {
       label: "Avg speed",
@@ -259,13 +456,17 @@ function Index() {
       label: "Max lat G",
       value: maxGLat.toFixed(2),
       unit: "G",
-      sub: "Session max",
+      sub: isCurrentSessionLive
+        ? `Current: ${liveFrame?.frame.g_lat.toFixed(2)} G`
+        : "Session max",
     },
     {
       label: "Max braking G",
       value: `−${maxGBrake.toFixed(2)}`,
       unit: "G",
-      sub: "Session max",
+      sub: isCurrentSessionLive
+        ? `Current: ${liveFrame ? Math.abs(liveFrame.frame.g_lon).toFixed(2) : "0.00"} G`
+        : "Session max",
       negative: true,
     },
   ] as const;
@@ -281,34 +482,100 @@ function Index() {
             PORSCHE
           </span>
 
-          <div className="order-last w-full md:order-none md:w-80">
-            {sessions.length === 0 ? (
-              <div className="flex h-11 items-center rounded-md bg-secondary px-4 text-sm text-muted-foreground">
-                Loading sessions…
+          {/* Session Selector & Refresh */}
+          <div className="order-last flex w-full items-center gap-2 md:order-none md:w-[420px]">
+            {sessionsLoading && sessions.length === 0 ? (
+              <div className="flex h-11 flex-1 items-center gap-2 rounded-md bg-secondary px-4 text-sm text-muted-foreground">
+                <RefreshCw className="size-4 animate-spin text-accent" />
+                <span>Loading sessions…</span>
+              </div>
+            ) : sessionsError && sessions.length === 0 ? (
+              <div className="flex h-11 flex-1 items-center justify-between rounded-md border border-destructive/50 bg-destructive/10 px-3 text-xs text-destructive">
+                <span>Failed to load sessions</span>
+                <Button size="sm" variant="ghost" onClick={() => loadSessions(true)} className="h-7 text-xs">
+                  Retry
+                </Button>
+              </div>
+            ) : sessions.length === 0 ? (
+              <div className="flex h-11 flex-1 items-center rounded-md bg-secondary px-4 text-sm text-muted-foreground">
+                No sessions found in database
               </div>
             ) : (
-              <Select value={sessionId} onValueChange={setSessionId}>
-                <SelectTrigger aria-label="Select session" className="h-11 bg-secondary px-4">
-                  <SelectValue />
+              <Select
+                value={sessionId}
+                onValueChange={(val) => {
+                  setSessionId(val);
+                  setSelectedLapId(null);
+                }}
+              >
+                <SelectTrigger aria-label="Select session" className="h-11 flex-1 bg-secondary px-4">
+                  <SelectValue placeholder="Select session…" />
                 </SelectTrigger>
-                <SelectContent>
-                  {sessions.map((s) => (
-                    <SelectItem key={s.session_id} value={s.session_id}>
-                      {s.track_name} · {s.device_id} ·{" "}
-                      {new Date(s.created_at).toLocaleDateString()}
-                    </SelectItem>
-                  ))}
+                <SelectContent className="max-h-72">
+                  {sessions.map((s) => {
+                    const isSessionLive = liveFrame?.session_id === s.session_id;
+                    return (
+                      <SelectItem key={s.session_id} value={s.session_id}>
+                        <div className="flex items-center gap-2 py-0.5">
+                          {isSessionLive && (
+                            <span className="size-2 rounded-full bg-green-500 animate-pulse" />
+                          )}
+                          <span className="font-medium text-foreground">
+                            {s.track_name || "Unknown Track"}
+                          </span>
+                          <span className="text-muted-foreground">·</span>
+                          <span className="text-muted-foreground">{s.device_id}</span>
+                          <span className="text-muted-foreground">·</span>
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {formatSessionDateTime(s.created_at)}
+                          </span>
+                        </div>
+                      </SelectItem>
+                    );
+                  })}
                 </SelectContent>
               </Select>
             )}
+
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => loadSessions(false)}
+              disabled={sessionsLoading}
+              title="Refresh sessions from database"
+              className="h-11 w-11 shrink-0 border-border bg-secondary hover:bg-secondary/80"
+            >
+              <RefreshCw className={`size-4 ${sessionsLoading ? "animate-spin" : ""}`} />
+            </Button>
           </div>
 
-          <span className="flex items-center gap-2 rounded-full border border-border px-4 py-2 font-mono text-[11px] uppercase tracking-wider">
-            <span
-              className={`size-2 rounded-full ${isLive ? "animate-pulse bg-green-500" : "bg-muted-foreground"}`}
-            />
-            {isLive ? "● LIVE" : "● Offline"}
-          </span>
+          {/* Status Badge */}
+          <div className="flex items-center gap-2">
+            {isCurrentSessionLive ? (
+              <span className="flex items-center gap-2 rounded-full border border-green-500/30 bg-green-500/10 px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-green-400">
+                <span className="size-2 rounded-full animate-pulse bg-green-500" />
+                ● LIVE
+              </span>
+            ) : liveFrame ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSessionId(liveFrame.session_id);
+                  setSelectedLapId(null);
+                }}
+                className="h-8 gap-2 rounded-full border-green-500/40 bg-green-500/10 px-3 font-mono text-[11px] text-green-400 hover:bg-green-500/20"
+              >
+                <span className="size-2 rounded-full animate-pulse bg-green-500" />
+                Live streaming · View
+              </Button>
+            ) : (
+              <span className="flex items-center gap-2 rounded-full border border-border px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+                <span className="size-2 rounded-full bg-muted-foreground/40" />
+                ● Recorded
+              </span>
+            )}
+          </div>
         </header>
 
         {/* Hero */}
@@ -317,26 +584,36 @@ function Index() {
             <div>
               <p className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">
                 {session
-                  ? `${session.device_id} · ${new Date(session.created_at).toLocaleDateString()}`
+                  ? `${session.device_id} · ${formatSessionDateTime(session.created_at)}`
                   : "Waiting for session…"}
               </p>
               <h1 className="mt-2 text-5xl font-semibold tracking-tight md:text-6xl">
-                {session?.track_name ?? "No session"}
+                {session?.track_name || (session ? "Session " + session.session_id : "No session")}
               </h1>
               <p className="mt-3 text-sm text-muted-foreground">
-                {laps.length} lap{laps.length !== 1 ? "s" : ""} recorded
-                {liveFrame ? ` · Lap ${liveFrame.current_lap} in progress` : ""}
+                {laps.length} lap{laps.length !== 1 ? "s" : ""} recorded · {allPoints.length} data points
+                {isCurrentSessionLive && liveFrame ? ` · Lap ${liveFrame.current_lap} in progress` : ""}
               </p>
             </div>
             <div className="text-right">
               <p className="text-[11px] uppercase tracking-[0.25em] text-muted-foreground">
                 Best lap
               </p>
-              <p className="mt-2 text-5xl font-semibold tracking-tight md:text-6xl">
-                {bestLap ? formatLapTime(bestLap.duration_ms) : "—"}
-              </p>
+              <div className="mt-2 text-5xl font-semibold tracking-tight md:text-6xl">
+                {loading ? (
+                  <Skeleton className="h-14 w-44 ml-auto" />
+                ) : bestLap ? (
+                  formatLapTime(bestLap.duration_ms)
+                ) : (
+                  "—"
+                )}
+              </div>
               <p className="mt-3 text-sm text-muted-foreground">
-                {bestLap ? `Lap ${bestLap.lap_number} · session best` : "No laps yet"}
+                {bestLap
+                  ? `Lap ${bestLap.lap_number} · session best`
+                  : laps.length > 0
+                    ? "No valid lap times"
+                    : "No laps yet"}
               </p>
             </div>
           </div>
@@ -345,7 +622,7 @@ function Index() {
           </div>
           <div className="relative mx-auto mt-24 max-w-5xl md:mt-32">
             <div className="absolute inset-x-[8%] bottom-[12%] h-[18%] rounded-[50%] border border-border bg-secondary/40 blur-[1px]" />
-            <img src={car} alt="Red 911 GT2 RS side profile" className="relative w-full" />
+            <img src={car} alt="911 GT2 RS side profile" className="relative w-full" />
           </div>
         </section>
 
@@ -357,8 +634,14 @@ function Index() {
               className={`panel p-5 ${"highlight" in k && k.highlight ? "border-accent/60" : ""}`}
             >
               <p className="text-xs text-muted-foreground">{k.label}</p>
-              <p
-                className={`mt-3 font-mono text-2xl font-semibold ${"highlight" in k && k.highlight ? "text-accent" : "negative" in k && k.negative ? "text-destructive" : ""}`}
+              <div
+                className={`mt-3 font-mono text-2xl font-semibold ${
+                  "highlight" in k && k.highlight
+                    ? "text-accent"
+                    : "negative" in k && k.negative
+                      ? "text-destructive"
+                      : ""
+                }`}
               >
                 {loading ? (
                   <Skeleton className="h-7 w-24" />
@@ -370,7 +653,7 @@ function Index() {
                     </span>
                   </>
                 )}
-              </p>
+              </div>
               {"bar" in k && k.bar ? (
                 <div className="mt-3 h-1 rounded-full bg-secondary">
                   <div
@@ -392,18 +675,67 @@ function Index() {
 
           {/* Track Map */}
           <div className="panel p-6">
-            <div className="flex justify-between">
-              <h2 className="font-medium">Circuit map &amp; speed trace</h2>
-              <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                {telemetry.length > 0 ? `${telemetry.length} pts` : "No data"}
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <h2 className="font-medium">Circuit map &amp; speed trace</h2>
+                {selectedLapId && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setSelectedLapId(null)}
+                    className="h-6 text-xs text-accent hover:text-accent/80 px-2"
+                  >
+                    Reset to all laps ✕
+                  </Button>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {isCurrentSessionLive ? (
+                  <span className="flex items-center gap-1.5 rounded-full border border-green-500/40 bg-green-500/10 px-3 py-1 font-mono text-xs text-green-400">
+                    <span className="size-2 rounded-full bg-green-500 animate-pulse" />
+                    {liveFrame && liveFrame.current_lap >= 2
+                      ? `Lap ${liveFrame.current_lap} · Pe traseul creat`
+                      : "Lap 1 · Creare traseu live"}
+                  </span>
+                ) : (
+                  <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
+                    {projectedTrack.length > 0 ? `${projectedTrack.length} pts` : "No data"}
+                  </span>
+                )}
+                {selectedLapId && (
+                  <span className="rounded-full bg-accent/20 px-2.5 py-0.5 text-xs text-accent font-mono">
+                    Lap {laps.find((l) => l.lap_id === selectedLapId)?.lap_number ?? ""}
+                  </span>
+                )}
+              </div>
             </div>
-            <svg viewBox="0 0 400 220" className="mt-4 w-full">
-              {projected.length > 1 ? (
+
+            <svg viewBox="0 0 400 220" className="mt-4 w-full select-none">
+              {projectedTrack.length > 1 ? (
                 <>
-                  {/* Per-segment coloured polyline */}
-                  {projected.slice(0, -1).map((pt, i) => {
-                    const next = projected[i + 1];
+                  {/* Road Corridor Outer Border / Curbs (Traseu cu lățime reală) */}
+                  <polyline
+                    points={projectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                    fill="none"
+                    stroke="rgba(255, 255, 255, 0.09)"
+                    strokeWidth="15"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+
+                  {/* Road Asphalt Surface */}
+                  <polyline
+                    points={projectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                    fill="none"
+                    stroke="#141416"
+                    strokeWidth="11"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+
+                  {/* Per-segment Coloured Speed Trace */}
+                  {projectedTrack.slice(0, -1).map((pt, i) => {
+                    const next = projectedTrack[i + 1];
                     if (!next) return null;
                     return (
                       <line
@@ -413,34 +745,77 @@ function Index() {
                         x2={next.x}
                         y2={next.y}
                         stroke={speedColor(pt.speed, mapMaxSpeed)}
-                        strokeWidth="3"
+                        strokeWidth="3.5"
                         strokeLinecap="round"
                       />
                     );
                   })}
-                  {/* Apex markers */}
-                  {projected
+
+                  {/* Start Point Marker (Green) */}
+                  {startPoint && (
+                    <circle
+                      cx={startPoint.x}
+                      cy={startPoint.y}
+                      r="4.5"
+                      fill="#22c55e"
+                      stroke="#09090b"
+                      strokeWidth="2"
+                    />
+                  )}
+
+                  {/* End Point Marker (Red, only if open sprint track) */}
+                  {endPoint && (
+                    <circle
+                      cx={endPoint.x}
+                      cy={endPoint.y}
+                      r="4.5"
+                      fill="#ef4444"
+                      stroke="#09090b"
+                      strokeWidth="2"
+                    />
+                  )}
+
+                  {/* Apex Markers */}
+                  {projectedTrack
                     .filter((p) => p.apex === 1)
                     .map((p, i) => (
                       <circle
                         key={`apex-${i}`}
                         cx={p.x}
                         cy={p.y}
-                        r="4"
-                        fill="orange"
-                        opacity="0.8"
+                        r="3.5"
+                        fill="#f97316"
+                        opacity="0.85"
                       />
                     ))}
-                  {/* Live position */}
-                  {liveDot && (
-                    <circle
-                      cx={liveDot.x}
-                      cy={liveDot.y}
-                      r="7"
-                      fill="var(--background)"
-                      stroke="var(--accent)"
-                      strokeWidth="3"
-                    />
+
+                  {/* Live Car Dot (Snaps to established track from Lap 2+, tracks leading edge on Lap 1) */}
+                  {carDot && (
+                    <g>
+                      <circle
+                        cx={carDot.x}
+                        cy={carDot.y}
+                        r="11"
+                        fill="none"
+                        stroke="var(--accent)"
+                        strokeWidth="1.5"
+                        opacity="0.3"
+                      />
+                      <circle
+                        cx={carDot.x}
+                        cy={carDot.y}
+                        r="6"
+                        fill="#09090b"
+                        stroke="var(--accent)"
+                        strokeWidth="3"
+                      />
+                      <circle
+                        cx={carDot.x}
+                        cy={carDot.y}
+                        r="2.5"
+                        fill="var(--accent)"
+                      />
+                    </g>
                   )}
                 </>
               ) : (
@@ -449,23 +824,35 @@ function Index() {
                   y="110"
                   textAnchor="middle"
                   fill="var(--muted-foreground)"
-                  fontSize="14"
+                  fontSize="13"
                   fontFamily="JetBrains Mono, monospace"
                 >
-                  {loading ? "Loading telemetry…" : "No telemetry data yet"}
+                  {isCurrentSessionLive
+                    ? "Recording live telemetry… Drive to draw circuit map"
+                    : loading
+                      ? "Loading telemetry…"
+                      : "No telemetry data yet"}
                 </text>
               )}
             </svg>
+
             <div className="mt-3 flex justify-between font-mono text-xs text-muted-foreground">
               <span>
                 Peak speed{" "}
                 <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
               </span>
-              {liveFrame && (
-                <span>
-                  Lap <b className="text-foreground">{liveFrame.current_lap}</b>
+              <div className="flex items-center gap-3">
+                <span className="flex items-center gap-1 text-[11px]">
+                  <span className="size-2 rounded-full bg-[#ef4444]" /> Slow
+                  <span className="size-2 rounded-full bg-[#eab308] ml-1" /> Med
+                  <span className="size-2 rounded-full bg-[#22c55e] ml-1" /> Fast
                 </span>
-              )}
+                {isCurrentSessionLive && liveFrame && (
+                  <span>
+                    Lap <b className="text-foreground">{liveFrame.current_lap}</b>
+                  </span>
+                )}
+              </div>
             </div>
           </div>
 
@@ -474,11 +861,12 @@ function Index() {
             <div className="flex justify-between">
               <h2 className="font-medium">G-G diagram</h2>
               <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                {liveFrame
+                {isCurrentSessionLive && liveFrame
                   ? `Total G ${totalG.toFixed(2)}`
                   : `${gSample.length} samples`}
               </span>
             </div>
+
             <svg viewBox="0 0 220 220" className="mx-auto mt-4 w-full max-w-[260px]">
               {/* Concentric dashed circles */}
               {[100, 70, 40].map((r) => (
@@ -492,49 +880,78 @@ function Index() {
                   strokeDasharray="3 3"
                 />
               ))}
+
+              {/* Labels for circles */}
+              <text x="113" y="73" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">0.5G</text>
+              <text x="113" y="43" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">1.0G</text>
+              <text x="113" y="13" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">1.5G</text>
+
               {/* Crosshairs */}
               <line x1="10" y1="110" x2="210" y2="110" stroke="var(--border)" />
               <line x1="110" y1="10" x2="110" y2="210" stroke="var(--border)" />
+
               {/* Scatter dots from telemetry */}
-              {gSample.map((p, i) => (
+              {gSample.map((p, i) => {
+                const cx = Math.max(10, Math.min(210, 110 + p.g_lat * 52));
+                const cy = Math.max(10, Math.min(210, 110 - p.g_lon * 47));
+                return (
+                  <circle
+                    key={i}
+                    cx={cx}
+                    cy={cy}
+                    r="1.8"
+                    fill="var(--accent)"
+                    opacity="0.45"
+                  />
+                );
+              })}
+
+              {/* Live needle & indicator */}
+              {isCurrentSessionLive ? (
+                <>
+                  <line
+                    x1="110"
+                    y1="110"
+                    x2={gx}
+                    y2={gy}
+                    stroke="var(--accent)"
+                    strokeWidth="3"
+                  />
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="6"
+                    fill="var(--background)"
+                    stroke="var(--accent)"
+                    strokeWidth="3"
+                  />
+                </>
+              ) : (
                 <circle
-                  key={i}
-                  cx={110 + p.g_lat * 52}
-                  cy={110 - p.g_lon * 47}
-                  r="1.6"
+                  cx="110"
+                  cy="110"
+                  r="3.5"
                   fill="var(--accent)"
-                  opacity="0.4"
+                  opacity="0.8"
                 />
-              ))}
-              {/* Live needle */}
-              <line
-                x1="110"
-                y1="110"
-                x2={gx}
-                y2={gy}
-                stroke="var(--accent)"
-                strokeWidth="3"
-              />
-              <circle
-                cx={gx}
-                cy={gy}
-                r="6"
-                fill="var(--background)"
-                stroke="var(--accent)"
-                strokeWidth="3"
-              />
+              )}
             </svg>
+
             <div className="mt-3 flex justify-between font-mono text-xs text-muted-foreground">
               <span>
                 Lateral{" "}
                 <b className="text-accent">
-                  +{gLat.toFixed(2)} G
+                  {isCurrentSessionLive
+                    ? `${currentGLat >= 0 ? "+" : ""}${currentGLat.toFixed(2)} G`
+                    : `+${maxGLat.toFixed(2)} G max`}
                 </b>
               </span>
               <span>
                 Longitudinal{" "}
                 <b className="text-destructive">
-                  {gLon >= 0 ? "+" : "−"}{Math.abs(gLon).toFixed(2)} G
+                  {isCurrentSessionLive
+                    ? `${currentGLon >= 0 ? "+" : "−"}${Math.abs(currentGLon).toFixed(2)} G`
+                    : `−${maxGBrake.toFixed(2)} G max brk`}
                 </b>
               </span>
             </div>
@@ -544,12 +961,24 @@ function Index() {
         {/* Laps Table */}
         <section className="panel mt-3 p-6">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="font-medium">
-              Session laps{" "}
-              <span className="ml-2 rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                {laps.length} total
-              </span>
-            </h2>
+            <div className="flex items-center gap-2">
+              <h2 className="font-medium">
+                Session laps{" "}
+                <span className="ml-2 rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
+                  {laps.length} total
+                </span>
+              </h2>
+              {selectedLapId && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSelectedLapId(null)}
+                  className="h-7 text-xs text-accent hover:text-accent/80"
+                >
+                  Show all laps ✕
+                </Button>
+              )}
+            </div>
             <div className="flex rounded-full bg-secondary p-1 text-xs">
               {(["All laps", "Valid only"] as const).map((l, i) => (
                 <Button
@@ -565,11 +994,12 @@ function Index() {
               ))}
             </div>
           </div>
+
           <div className="mt-4 overflow-x-auto">
             <table className="w-full min-w-[600px] font-mono text-sm">
               <thead>
                 <tr className="text-left text-[11px] uppercase tracking-wider text-muted-foreground">
-                  {["Lap", "Lap time", "Delta", "Max speed", "Max lat G", "Max brk G"].map(
+                  {["Lap", "Lap time", "Delta", "Max speed", "Max lat G", "Max brk G", "Trace"].map(
                     (h) => (
                       <th key={h} className="py-3 font-normal">
                         {h}
@@ -580,9 +1010,9 @@ function Index() {
               </thead>
               <tbody>
                 {loading
-                  ? Array.from({ length: 4 }).map((_, i) => (
+                  ? Array.from({ length: 3 }).map((_, i) => (
                       <tr key={i} className="border-t border-border">
-                        {Array.from({ length: 6 }).map((__, j) => (
+                        {Array.from({ length: 7 }).map((__, j) => (
                           <td key={j} className="py-3">
                             <Skeleton className="h-4 w-20" />
                           </td>
@@ -591,17 +1021,36 @@ function Index() {
                     ))
                   : visibleLaps.map((lap) => {
                       const isBest = bestLap?.lap_id === lap.lap_id;
+                      const isSelected = selectedLapId === lap.lap_id;
                       const delta =
-                        bestLap && !isBest
+                        bestLap && !isBest && lap.duration_ms > 0
                           ? formatDelta(lap.duration_ms - bestLap.duration_ms)
                           : null;
                       return (
                         <tr
                           key={lap.lap_id}
-                          className={`border-t border-border ${isBest ? "bg-secondary" : ""}`}
+                          onClick={() =>
+                            setSelectedLapId((prev) =>
+                              prev === lap.lap_id ? null : lap.lap_id,
+                            )
+                          }
+                          className={`cursor-pointer border-t border-border transition-colors hover:bg-secondary/60 ${
+                            isSelected
+                              ? "bg-accent/10 border-accent/40"
+                              : isBest
+                                ? "bg-secondary/40"
+                                : ""
+                          }`}
                         >
-                          <td className="py-3">L{lap.lap_number}</td>
-                          <td className={isBest ? "text-accent" : ""}>
+                          <td className="py-3 font-medium">
+                            <div className="flex items-center gap-2">
+                              {isSelected && (
+                                <span className="size-1.5 rounded-full bg-accent" />
+                              )}
+                              L{lap.lap_number}
+                            </div>
+                          </td>
+                          <td className={isBest ? "text-accent font-semibold" : ""}>
                             {formatLapTime(lap.duration_ms)}
                           </td>
                           <td>
@@ -611,7 +1060,7 @@ function Index() {
                               </span>
                             ) : (
                               <span className="text-muted-foreground">
-                                {delta}
+                                {delta ?? "—"}
                               </span>
                             )}
                           </td>
@@ -623,16 +1072,33 @@ function Index() {
                           <td className="text-destructive">
                             −{lap.max_g_brake.toFixed(2)} G
                           </td>
+                          <td>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs text-muted-foreground hover:text-foreground"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedLapId((prev) =>
+                                  prev === lap.lap_id ? null : lap.lap_id,
+                                );
+                              }}
+                            >
+                              {isSelected ? "Selected" : "View lap"}
+                            </Button>
+                          </td>
                         </tr>
                       );
                     })}
                 {!loading && visibleLaps.length === 0 && (
                   <tr>
                     <td
-                      colSpan={6}
+                      colSpan={7}
                       className="py-8 text-center text-muted-foreground"
                     >
-                      No laps recorded yet
+                      {allPoints.length > 0
+                        ? "Session in progress (telemetry points available above, lap not finalized yet)"
+                        : "No laps recorded yet"}
                     </td>
                   </tr>
                 )}

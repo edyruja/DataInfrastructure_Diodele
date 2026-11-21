@@ -1,9 +1,17 @@
 // API + WebSocket client for DataInfrastructure_Diodele telemetry backend
 
-export const API_BASE_URL =
-  "https://datainfrastructure-diodele.cristianstefanpopa05.workers.dev";
+const RAW_API_URL = (
+  (typeof import.meta !== "undefined" && (import.meta.env?.["VITE_API_URL"] as string | undefined)) ||
+  "https://datainfrastructure-diodele.cristianstefanpopa05.workers.dev"
+).replace(/\/+$/, "");
+
+export const API_BASE_URL = RAW_API_URL.endsWith("/api")
+  ? RAW_API_URL
+  : `${RAW_API_URL}/api`;
+
 export const WS_LIVE_URL =
-  "wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws?role=web";
+  (typeof import.meta !== "undefined" && (import.meta.env?.["VITE_WS_URL"] as string | undefined)) ||
+  `${RAW_API_URL.replace(/^http/, "ws")}/ws?role=web`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,9 +66,16 @@ export type LiveFrame = {
   };
 };
 
+export type LapCompletedMsg = {
+  type: "LAP_COMPLETED";
+  session_id: string;
+  lap_number: number;
+  duration_ms: number;
+};
+
 export type SessionEndedMsg = { type: "SESSION_ENDED"; session_id: string };
 
-export type WsMessage = LiveFrame | SessionEndedMsg;
+export type WsMessage = LiveFrame | LapCompletedMsg | SessionEndedMsg;
 
 // ---------------------------------------------------------------------------
 // API fetch helpers
@@ -80,7 +95,7 @@ export async function fetchLaps(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ApiLap[]> {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/laps`, {
+  const res = await fetch(`${API_BASE_URL}/sessions/${encodeURIComponent(sessionId)}/laps`, {
     signal: signal ?? null,
   });
   if (!res.ok) throw new Error(`fetchLaps: HTTP ${res.status}`);
@@ -91,7 +106,7 @@ export async function fetchTelemetry(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TelemetryPoint[]> {
-  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/telemetry`, {
+  const res = await fetch(`${API_BASE_URL}/sessions/${encodeURIComponent(sessionId)}/telemetry`, {
     signal: signal ?? null,
   });
   if (!res.ok) throw new Error(`fetchTelemetry: HTTP ${res.status}`);
@@ -102,7 +117,7 @@ export async function fetchLapTelemetry(
   lapId: string,
   signal?: AbortSignal,
 ): Promise<TelemetryPoint[]> {
-  const res = await fetch(`${API_BASE_URL}/laps/${lapId}/telemetry`, {
+  const res = await fetch(`${API_BASE_URL}/laps/${encodeURIComponent(lapId)}/telemetry`, {
     signal: signal ?? null,
   });
   if (!res.ok) throw new Error(`fetchLapTelemetry: HTTP ${res.status}`);
@@ -112,6 +127,24 @@ export async function fetchLapTelemetry(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/** Format ISO date string into readable Date & Time */
+export function formatSessionDateTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return `${d.toLocaleDateString(undefined, {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    })} ${d.toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+    })}`;
+  } catch {
+    return iso;
+  }
+}
 
 /** Format duration_ms as "M:SS.mmm"  e.g. 64320 → "1:04.320" */
 export function formatLapTime(ms: number): string {
@@ -146,5 +179,183 @@ export function speedColor(speed: number, maxSpeed: number): string {
     const f = t * 2;
     const g = Math.round(205 * f);
     return `rgb(220,${g},0)`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Circuit projection & track snapping helpers
+// ---------------------------------------------------------------------------
+
+export type Projected = {
+  x: number;
+  y: number;
+  speed: number;
+  apex: 0 | 1;
+};
+
+export type TrackBounds = {
+  minLat: number;
+  maxLat: number;
+  minLon: number;
+  maxLon: number;
+};
+
+export function haversineMeters(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): number {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+export function computeTrackBounds(
+  points: Array<{ lat: number; lon: number }>,
+  minSpanMeters = 60,
+): TrackBounds | null {
+  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
+  if (valid.length === 0) return null;
+
+  const first = valid[0]!;
+  let minLat = first.lat;
+  let maxLat = first.lat;
+  let minLon = first.lon;
+  let maxLon = first.lon;
+
+  for (let i = 1; i < valid.length; i++) {
+    const p = valid[i]!;
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lon < minLon) minLon = p.lon;
+    if (p.lon > maxLon) maxLon = p.lon;
+  }
+
+  const meanLat = (minLat + maxLat) / 2;
+  const metersPerDegLat = 111320;
+  const metersPerDegLon = 111320 * Math.cos((meanLat * Math.PI) / 180);
+
+  const spanLatMeters = (maxLat - minLat) * metersPerDegLat;
+  const spanLonMeters = (maxLon - minLon) * metersPerDegLon;
+
+  if (spanLatMeters < minSpanMeters) {
+    const padDeg = (minSpanMeters - spanLatMeters) / 2 / metersPerDegLat;
+    minLat -= padDeg;
+    maxLat += padDeg;
+  }
+
+  if (spanLonMeters < minSpanMeters) {
+    const padDeg = (minSpanMeters - spanLonMeters) / 2 / (metersPerDegLon || 1);
+    minLon -= padDeg;
+    maxLon += padDeg;
+  }
+
+  return { minLat, maxLat, minLon, maxLon };
+}
+
+export function projectCoordWithBounds(
+  lat: number,
+  lon: number,
+  bounds: TrackBounds,
+  w = 400,
+  h = 220,
+  pad = 24,
+): { x: number; y: number } {
+  const meanLatRad = (((bounds.minLat + bounds.maxLat) / 2) * Math.PI) / 180;
+  const cosLat = Math.cos(meanLatRad);
+
+  const rangeX = Math.max(0.000001, (bounds.maxLon - bounds.minLon) * cosLat);
+  const rangeY = Math.max(0.000001, bounds.maxLat - bounds.minLat);
+
+  const scale = Math.min((w - 2 * pad) / rangeX, (h - 2 * pad) / rangeY);
+  const offsetX = (w - rangeX * scale) / 2;
+  const offsetY = (h - rangeY * scale) / 2;
+
+  return {
+    x: offsetX + (lon - bounds.minLon) * cosLat * scale,
+    y: h - offsetY - (lat - bounds.minLat) * scale,
+  };
+}
+
+export function projectPoints(
+  points: TelemetryPoint[],
+  w = 400,
+  h = 220,
+  pad = 24,
+  boundsOverride?: TrackBounds | null,
+): Projected[] {
+  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
+  if (!valid.length) return [];
+
+  const bounds = boundsOverride || computeTrackBounds(valid);
+  if (!bounds) return [];
+
+  return valid.map((p) => {
+    const { x, y } = projectCoordWithBounds(p.lat, p.lon, bounds, w, h, pad);
+    return {
+      x,
+      y,
+      speed: p.speed_kmh,
+      apex: p.is_corner_apex,
+    };
+  });
+}
+
+/**
+ * Snaps a 2D point (x, y) onto the closest segment of a reference track polyline.
+ * If distance is within maxCorridorPx, snaps directly to the centerline.
+ * If slightly further away, clamps to the corridor threshold so the car never falls off track.
+ */
+export function snapPointToPolyline(
+  p: { x: number; y: number },
+  polyline: Array<{ x: number; y: number }>,
+  maxCorridorPx = 45,
+): { x: number; y: number; distance: number; segmentIndex: number } {
+  if (polyline.length === 0) return { x: p.x, y: p.y, distance: 0, segmentIndex: 0 };
+  if (polyline.length === 1) {
+    const first = polyline[0]!;
+    const d = Math.hypot(p.x - first.x, p.y - first.y);
+    return { x: first.x, y: first.y, distance: d, segmentIndex: 0 };
+  }
+
+  let best = { x: polyline[0]!.x, y: polyline[0]!.y, distSq: Infinity, segmentIndex: 0 };
+
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const a = polyline[i]!;
+    const b = polyline[i + 1]!;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+
+    let t = lenSq === 0 ? 0 : ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+
+    const sx = a.x + t * dx;
+    const sy = a.y + t * dy;
+    const distSq = (p.x - sx) ** 2 + (p.y - sy) ** 2;
+
+    if (distSq < best.distSq) {
+      best = { x: sx, y: sy, distSq, segmentIndex: i };
+    }
+  }
+
+  const distance = Math.sqrt(best.distSq);
+
+  if (distance <= maxCorridorPx) {
+    return { x: best.x, y: best.y, distance, segmentIndex: best.segmentIndex };
+  } else {
+    const ratio = maxCorridorPx / distance;
+    const clampedX = best.x + (p.x - best.x) * ratio;
+    const clampedY = best.y + (p.y - best.y) * ratio;
+    return { x: clampedX, y: clampedY, distance, segmentIndex: best.segmentIndex };
   }
 }
