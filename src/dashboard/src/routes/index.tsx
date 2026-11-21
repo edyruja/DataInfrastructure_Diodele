@@ -655,7 +655,7 @@ function Index() {
         x: carPos.x,
         y: carPos.y,
         speed: replayTrackPos.speed_kmh,
-        apex: 0,
+        apex: 0 as const,
       },
     ];
   }, [isReplaying, replayTrackPos, fullProjectedTrack, trackBounds]);
@@ -820,7 +820,7 @@ function Index() {
           x: carDot.x,
           y: carDot.y,
           speed: carDot.speed,
-          apex: 0,
+          apex: 0 as const,
         };
       }
       return interpolateTrackSpline(pts, false, 3);
@@ -1001,7 +1001,7 @@ function Index() {
       value: maxGLat.toFixed(2),
       unit: "G",
       sub: isCurrentSessionLive
-        ? `Current: ${liveFrame?.frame.g_lat.toFixed(2)} G`
+        ? `Current: ${(liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0).toFixed(2)} G`
         : isReplaying && currentReplayFrame
           ? `Current: ${currentReplayFrame.g_lat.toFixed(2)} G`
           : "Session max",
@@ -1011,7 +1011,7 @@ function Index() {
       value: `−${maxGBrake.toFixed(2)}`,
       unit: "G",
       sub: isCurrentSessionLive
-        ? `Current: ${liveFrame ? Math.abs(liveFrame.frame.g_lon).toFixed(2) : "0.00"} G`
+        ? `Current: ${Math.abs(liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0).toFixed(2)} G`
         : isReplaying && currentReplayFrame
           ? `Current: ${Math.abs(currentReplayFrame.g_lon).toFixed(2)} G`
           : "Session max",

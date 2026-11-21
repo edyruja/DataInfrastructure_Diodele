@@ -258,11 +258,11 @@ export type Projected = {
   y: number;
   speed: number;
   apex: 0 | 1;
-  g_lat?: number;
-  g_lon?: number;
-  lat?: number;
-  lon?: number;
-  timeMs?: number;
+  g_lat?: number | undefined;
+  g_lon?: number | undefined;
+  lat?: number | undefined;
+  lon?: number | undefined;
+  timeMs?: number | undefined;
 };
 
 export type TrackBounds = {
