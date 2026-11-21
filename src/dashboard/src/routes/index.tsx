@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
-import { RefreshCw, Play, Pause, RotateCcw } from "lucide-react";
+import { RefreshCw, Play, Pause, RotateCcw, Plus, Minus } from "lucide-react";
 import {
   type ApiSession,
   type ApiLap,
@@ -62,6 +62,17 @@ export const Route = createFileRoute("/")({
 });
 
 // ---------------------------------------------------------------------------
+// G-G Diagram Zoom Levels (1.5G default -> 1.2G -> 0.9G -> 0.6G for small forces)
+// ---------------------------------------------------------------------------
+
+const G_ZOOM_LEVELS = [
+  { maxG: 1.5, circles: ["0.5", "1.0", "1.5"] },
+  { maxG: 1.2, circles: ["0.4", "0.8", "1.2"] },
+  { maxG: 0.9, circles: ["0.3", "0.6", "0.9"] },
+  { maxG: 0.6, circles: ["0.2", "0.4", "0.6"] },
+] as const;
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -80,6 +91,9 @@ function Index() {
   const [liveFrame, setLiveFrame] = useState<LiveFrame | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [validOnly, setValidOnly] = useState(false);
+
+  // ── G-G Diagram Zoom (index into G_ZOOM_LEVELS) ───────────────────────────
+  const [gZoomIndex, setGZoomIndex] = useState<number>(0);
 
   // ── 60 FPS Replay Mode (Historical sessions from DB only) ──────────────────
   const [isPlaying, setIsPlaying] = useState(false);
@@ -573,9 +587,15 @@ function Index() {
       ? currentReplayFrame.total_g
       : 0;
 
+  // Active zoom level on G-G Diagram
+  const currentGZoom = G_ZOOM_LEVELS[gZoomIndex] ?? G_ZOOM_LEVELS[0];
+  const scalePxPerG = 96 / currentGZoom.maxG;
+
   // SVG G-meter needle dot position
-  const gx = 110 + (isCurrentSessionLive || isReplaying ? currentGLat : 0) * 52;
-  const gy = 110 - (isCurrentSessionLive || isReplaying ? currentGLon : 0) * 47;
+  const rawGx = 110 + (isCurrentSessionLive || isReplaying ? currentGLat : 0) * scalePxPerG;
+  const rawGy = 110 - (isCurrentSessionLive || isReplaying ? currentGLon : 0) * scalePxPerG;
+  const gx = Math.max(10, Math.min(210, rawGx));
+  const gy = Math.max(10, Math.min(210, rawGy));
 
   // Current session object
   const session = sessions.find((s) => s.session_id === sessionId);
@@ -1159,8 +1179,36 @@ function Index() {
 
           {/* G-G Diagram */}
           <div className="panel p-6">
-            <div className="flex justify-between">
-              <h2 className="font-medium">G-G diagram</h2>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <h2 className="font-medium">G-G diagram</h2>
+                {/* Zoom Controls */}
+                <div className="flex items-center gap-0.5 rounded-full border border-border bg-secondary/80 px-1 py-0.5 shadow-sm">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => setGZoomIndex((prev) => Math.min(G_ZOOM_LEVELS.length - 1, prev + 1))}
+                    disabled={gZoomIndex >= G_ZOOM_LEVELS.length - 1}
+                    title="Zoom in (mărește scara pentru forțe G mici)"
+                    className="h-6 w-6 rounded-full text-muted-foreground hover:text-foreground disabled:opacity-30"
+                  >
+                    <Plus className="size-3" />
+                  </Button>
+                  <span className="font-mono text-[11px] font-semibold text-accent min-w-[3.2rem] text-center">
+                    ±{currentGZoom.maxG}G
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => setGZoomIndex((prev) => Math.max(0, prev - 1))}
+                    disabled={gZoomIndex <= 0}
+                    title="Zoom out"
+                    className="h-6 w-6 rounded-full text-muted-foreground hover:text-foreground disabled:opacity-30"
+                  >
+                    <Minus className="size-3" />
+                  </Button>
+                </div>
+              </div>
               <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
                 {(isCurrentSessionLive && liveFrame) || isReplaying
                   ? `Total G ${totalG.toFixed(2)}`
@@ -1169,8 +1217,8 @@ function Index() {
             </div>
 
             <svg viewBox="0 0 220 220" className="mx-auto mt-4 w-full max-w-[260px]">
-              {/* Concentric dashed circles */}
-              {[100, 70, 40].map((r) => (
+              {/* Concentric dashed circles (3 levels: 0.33, 0.66, 1.0 of max scale) */}
+              {[96, 64, 32].map((r) => (
                 <circle
                   key={r}
                   cx="110"
@@ -1182,10 +1230,16 @@ function Index() {
                 />
               ))}
 
-              {/* Labels for circles */}
-              <text x="113" y="73" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">0.5G</text>
-              <text x="113" y="43" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">1.0G</text>
-              <text x="113" y="13" fill="var(--muted-foreground)" fontSize="7" opacity="0.6">1.5G</text>
+              {/* Dynamic Labels for circles based on active zoom level */}
+              <text x="113" y="81" fill="var(--muted-foreground)" fontSize="7" opacity="0.75">
+                {currentGZoom.circles[0]}G
+              </text>
+              <text x="113" y="49" fill="var(--muted-foreground)" fontSize="7" opacity="0.75">
+                {currentGZoom.circles[1]}G
+              </text>
+              <text x="113" y="17" fill="var(--muted-foreground)" fontSize="7" opacity="0.75">
+                {currentGZoom.circles[2]}G
+              </text>
 
               {/* Crosshairs */}
               <line x1="10" y1="110" x2="210" y2="110" stroke="var(--border)" />
@@ -1194,8 +1248,8 @@ function Index() {
               {/* Scatter dots from telemetry (hidden during Replay, shown in normal/exit view) */}
               {!isReplaying &&
                 gSample.map((p, i) => {
-                  const cx = Math.max(10, Math.min(210, 110 + p.g_lat * 52));
-                  const cy = Math.max(10, Math.min(210, 110 - p.g_lon * 47));
+                  const cx = Math.max(10, Math.min(210, 110 + p.g_lat * scalePxPerG));
+                  const cy = Math.max(10, Math.min(210, 110 - p.g_lon * scalePxPerG));
                   return (
                     <circle
                       key={i}
