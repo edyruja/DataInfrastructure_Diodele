@@ -11,7 +11,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { RefreshCw } from "lucide-react";
+import { Slider } from "@/components/ui/slider";
+import { RefreshCw, Play, Pause, RotateCcw } from "lucide-react";
 import {
   type ApiSession,
   type ApiLap,
@@ -32,6 +33,7 @@ import {
   projectCoordWithBounds,
   snapPointToPolyline,
   haversineMeters,
+  interpolateTelemetryPoint,
 } from "@/lib/telemetry-sessions";
 
 // ---------------------------------------------------------------------------
@@ -76,6 +78,13 @@ function Index() {
   const [liveFrame, setLiveFrame] = useState<LiveFrame | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [validOnly, setValidOnly] = useState(false);
+
+  // ── 60 FPS Replay Mode (Historical sessions from DB only) ──────────────────
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState<number>(1);
+  const [replayTimeMs, setReplayTimeMs] = useState<number | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const lastTickTimeRef = useRef<number | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -253,6 +262,75 @@ function Index() {
     return telemetry.filter((p) => p.lap_id === selectedLapId);
   }, [telemetry, selectedLapId]);
 
+  // Duration and base time of current displayed telemetry
+  const baseTimeMs = useMemo(() => {
+    return displayedTelemetry.length > 0 ? displayedTelemetry[0]!.lap_offset_ms : 0;
+  }, [displayedTelemetry]);
+
+  const totalDurationMs = useMemo(() => {
+    if (displayedTelemetry.length < 2) return 0;
+    const start = displayedTelemetry[0]!.lap_offset_ms;
+    const end = displayedTelemetry[displayedTelemetry.length - 1]!.lap_offset_ms;
+    return Math.max(0, end - start);
+  }, [displayedTelemetry]);
+
+  // Reset replay state whenever session or lap selection changes
+  useEffect(() => {
+    setIsPlaying(false);
+    setReplayTimeMs(null);
+  }, [sessionId, selectedLapId]);
+
+  // ── 60 FPS Replay Animation Loop (requestAnimationFrame) ─────────────────
+  useEffect(() => {
+    if (!isPlaying || isCurrentSessionLive || !displayedTelemetry.length || totalDurationMs <= 0) {
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      lastTickTimeRef.current = null;
+      return;
+    }
+
+    const tick = (now: number) => {
+      if (lastTickTimeRef.current === null) {
+        lastTickTimeRef.current = now;
+      }
+      const deltaSec = (now - lastTickTimeRef.current) / 1000;
+      lastTickTimeRef.current = now;
+
+      setReplayTimeMs((prev) => {
+        const current = prev ?? 0;
+        const next = current + deltaSec * 1000 * replaySpeed;
+        if (next >= totalDurationMs) {
+          setIsPlaying(false);
+          return totalDurationMs;
+        }
+        return next;
+      });
+
+      animFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    animFrameRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      lastTickTimeRef.current = null;
+    };
+  }, [isPlaying, isCurrentSessionLive, displayedTelemetry, totalDurationMs, replaySpeed]);
+
+  const isReplaying =
+    !isCurrentSessionLive && replayTimeMs !== null && displayedTelemetry.length > 1;
+
+  // Interpolated 60 FPS state for replay
+  const currentReplayFrame = useMemo(() => {
+    if (!isReplaying || replayTimeMs === null) return null;
+    return interpolateTelemetryPoint(displayedTelemetry, baseTimeMs + replayTimeMs);
+  }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
+
   // ── Reference Track: the established circuit path ────────────────────────
   // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
   // From Lap 2 onwards (or for recorded sessions), referenceTrack holds Lap 1 points (the circuit layout).
@@ -281,7 +359,7 @@ function Index() {
     return [];
   }, [isCurrentSessionLive, telemetry, selectedLapId, liveFrame?.current_lap, laps.length, liveTrackPoints]);
 
-  // Points used to render circuit geometry and compute bounds
+  // Points used to determine circuit geometry and compute bounds
   const activeTrackPoints = useMemo(() => {
     if (referenceTrack.length > 0) {
       return referenceTrack;
@@ -298,12 +376,36 @@ function Index() {
     return computeTrackBounds(activeTrackPoints);
   }, [activeTrackPoints]);
 
-  // Projected track points inside SVG viewBox (400 x 220)
-  const projectedTrack = useMemo(() => {
+  // Full projected track points inside SVG viewBox (400 x 220)
+  const fullProjectedTrack = useMemo(() => {
     return projectPoints(activeTrackPoints, 400, 220, 24, trackBounds);
   }, [activeTrackPoints, trackBounds]);
 
-  const startPoint = projectedTrack.length > 0 ? projectedTrack[0] : null;
+  // Dynamic track polyline: In Replay Mode, evolves dynamically at 60 FPS up to current point!
+  const projectedTrack = useMemo(() => {
+    if (!isReplaying || !currentReplayFrame || fullProjectedTrack.length === 0) {
+      return fullProjectedTrack;
+    }
+    const sliced = fullProjectedTrack.slice(0, currentReplayFrame.index + 1);
+    const p0 = fullProjectedTrack[currentReplayFrame.index];
+    const p1 = fullProjectedTrack[currentReplayFrame.index + 1];
+    if (p0 && p1 && currentReplayFrame.alpha > 0) {
+      const curX = p0.x + (p1.x - p0.x) * currentReplayFrame.alpha;
+      const curY = p0.y + (p1.y - p0.y) * currentReplayFrame.alpha;
+      return [
+        ...sliced,
+        {
+          x: curX,
+          y: curY,
+          speed: currentReplayFrame.speed_kmh,
+          apex: currentReplayFrame.is_corner_apex,
+        },
+      ];
+    }
+    return sliced;
+  }, [isReplaying, currentReplayFrame, fullProjectedTrack]);
+
+  const startPoint = fullProjectedTrack.length > 0 ? fullProjectedTrack[0] : null;
   const isClosedLoop = useMemo(() => {
     if (activeTrackPoints.length < 15) return false;
     const first = activeTrackPoints[0]!;
@@ -312,8 +414,8 @@ function Index() {
   }, [activeTrackPoints]);
 
   const endPoint =
-    projectedTrack.length > 1 && !isClosedLoop
-      ? projectedTrack[projectedTrack.length - 1]
+    fullProjectedTrack.length > 1 && !isClosedLoop
+      ? fullProjectedTrack[fullProjectedTrack.length - 1]
       : null;
 
   const mapMaxSpeed = useMemo(() => {
@@ -322,11 +424,33 @@ function Index() {
     return Math.max(...list.map((p) => p.speed_kmh));
   }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
-  // ── Live Car Dot with Track Snapping ─────────────────────────────────────
-  // Lap 1: Car dot is at the head of the trail being drawn live.
-  // Lap 2+: Car dot snaps onto the established reference track corridor so it never falls outside the track!
+  // ── Live / Replay Car Dot ────────────────────────────────────────────────
+  // In Replay Mode: car moves smoothly at 60 FPS along the circuit track.
+  // In Live Mode: snaps to reference track on Lap 2+, tracks leading edge on Lap 1.
   const carDot = useMemo(() => {
-    if (!isCurrentSessionLive || !liveFrame || projectedTrack.length === 0 || !trackBounds) {
+    // 1. Replay Mode:
+    if (isReplaying && currentReplayFrame && fullProjectedTrack.length > 0) {
+      const p0 = fullProjectedTrack[currentReplayFrame.index];
+      const p1 = fullProjectedTrack[currentReplayFrame.index + 1];
+      if (p0 && p1) {
+        return {
+          x: p0.x + (p1.x - p0.x) * currentReplayFrame.alpha,
+          y: p0.y + (p1.y - p0.y) * currentReplayFrame.alpha,
+          speed: currentReplayFrame.speed_kmh,
+          isSnapped: false,
+        };
+      } else if (p0) {
+        return {
+          x: p0.x,
+          y: p0.y,
+          speed: currentReplayFrame.speed_kmh,
+          isSnapped: false,
+        };
+      }
+    }
+
+    // 2. Live Mode:
+    if (!isCurrentSessionLive || !liveFrame || fullProjectedTrack.length === 0 || !trackBounds) {
       return null;
     }
 
@@ -340,8 +464,7 @@ function Index() {
         220,
         24,
       );
-      // Snapping to the reference polyline within track corridor
-      const snapped = snapPointToPolyline(rawPos, projectedTrack, 45);
+      const snapped = snapPointToPolyline(rawPos, fullProjectedTrack, 45);
       return {
         x: snapped.x,
         y: snapped.y,
@@ -352,16 +475,24 @@ function Index() {
     }
 
     // During live Lap 1: Car dot is at the head of the live path
-    const head = projectedTrack[projectedTrack.length - 1];
+    const head = fullProjectedTrack[fullProjectedTrack.length - 1];
     if (!head) return null;
     return {
       x: head.x,
       y: head.y,
       speed: liveFrame.frame.speed_kmh,
-      segmentIndex: projectedTrack.length - 1,
+      segmentIndex: fullProjectedTrack.length - 1,
       isSnapped: false,
     };
-  }, [isCurrentSessionLive, liveFrame, projectedTrack, trackBounds, referenceTrack.length]);
+  }, [
+    isReplaying,
+    currentReplayFrame,
+    fullProjectedTrack,
+    isCurrentSessionLive,
+    liveFrame,
+    trackBounds,
+    referenceTrack.length,
+  ]);
 
   // Overall points buffer for KPIs
   const allPoints = isCurrentSessionLive ? liveTrackPoints : telemetry;
@@ -405,14 +536,33 @@ function Index() {
     return 0;
   }, [laps, allPoints]);
 
-  const displaySpeed = isCurrentSessionLive && liveFrame ? liveFrame.frame.speed_kmh : maxSpeed;
-  const currentGLat = isCurrentSessionLive && liveFrame ? liveFrame.frame.g_lat : maxGLat;
-  const currentGLon = isCurrentSessionLive && liveFrame ? liveFrame.frame.g_lon : -maxGBrake;
-  const totalG = isCurrentSessionLive && liveFrame ? liveFrame.frame.total_g : 0;
+  const displaySpeed = isCurrentSessionLive && liveFrame
+    ? liveFrame.frame.speed_kmh
+    : isReplaying && currentReplayFrame
+      ? currentReplayFrame.speed_kmh
+      : maxSpeed;
 
-  // SVG G-meter live dot position
-  const gx = 110 + (isCurrentSessionLive ? currentGLat : 0) * 52;
-  const gy = 110 - (isCurrentSessionLive ? currentGLon : 0) * 47;
+  const currentGLat = isCurrentSessionLive && liveFrame
+    ? liveFrame.frame.g_lat
+    : isReplaying && currentReplayFrame
+      ? currentReplayFrame.g_lat
+      : maxGLat;
+
+  const currentGLon = isCurrentSessionLive && liveFrame
+    ? liveFrame.frame.g_lon
+    : isReplaying && currentReplayFrame
+      ? currentReplayFrame.g_lon
+      : -maxGBrake;
+
+  const totalG = isCurrentSessionLive && liveFrame
+    ? liveFrame.frame.total_g
+    : isReplaying && currentReplayFrame
+      ? currentReplayFrame.total_g
+      : 0;
+
+  // SVG G-meter needle dot position
+  const gx = 110 + (isCurrentSessionLive || isReplaying ? currentGLat : 0) * 52;
+  const gy = 110 - (isCurrentSessionLive || isReplaying ? currentGLon : 0) * 47;
 
   // Current session object
   const session = sessions.find((s) => s.session_id === sessionId);
@@ -422,13 +572,21 @@ function Index() {
     ? laps.filter((l) => l.lap_number > 1 || l.duration_ms > 0)
     : laps;
 
-  // G-G scatter (sample up to 150 points for rich distribution)
+  // G-G scatter: in Replay mode, shows points appearing sequentially up to current timestamp!
   const gSample = useMemo(() => {
+    if (isReplaying && currentReplayFrame) {
+      const upToNow = displayedTelemetry.filter(
+        (p) => p.lap_offset_ms <= currentReplayFrame.timeMs,
+      );
+      if (upToNow.length <= 150) return upToNow;
+      const step = Math.ceil(upToNow.length / 150);
+      return upToNow.filter((_, i) => i % step === 0);
+    }
     const source = isCurrentSessionLive ? liveTrackPoints : displayedTelemetry;
     if (source.length <= 150) return source;
     const step = Math.ceil(source.length / 150);
     return source.filter((_, i) => i % step === 0);
-  }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
+  }, [isReplaying, currentReplayFrame, isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
   // KPI cards
   const kpis = [
@@ -440,10 +598,14 @@ function Index() {
       highlight: true,
     },
     {
-      label: isCurrentSessionLive ? "Live speed" : "Max speed",
+      label: isCurrentSessionLive ? "Live speed" : isReplaying ? "Replay speed" : "Max speed",
       value: displaySpeed.toFixed(1),
       unit: "km/h",
-      sub: isCurrentSessionLive ? "Live" : "Session peak",
+      sub: isCurrentSessionLive
+        ? "Live"
+        : isReplaying
+          ? `T: ${formatLapTime(replayTimeMs ?? 0)}`
+          : "Session peak",
     },
     {
       label: "Avg speed",
@@ -458,7 +620,9 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${liveFrame?.frame.g_lat.toFixed(2)} G`
-        : "Session max",
+        : isReplaying && currentReplayFrame
+          ? `Current: ${currentReplayFrame.g_lat.toFixed(2)} G`
+          : "Session max",
     },
     {
       label: "Max braking G",
@@ -466,7 +630,9 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${liveFrame ? Math.abs(liveFrame.frame.g_lon).toFixed(2) : "0.00"} G`
-        : "Session max",
+        : isReplaying && currentReplayFrame
+          ? `Current: ${Math.abs(currentReplayFrame.g_lon).toFixed(2)} G`
+          : "Session max",
       negative: true,
     },
   ] as const;
@@ -670,6 +836,114 @@ function Index() {
           ))}
         </section>
 
+        {/* Replay Controls (Only for historical sessions from database, never in live mode) */}
+        {!isCurrentSessionLive && displayedTelemetry.length > 1 && (
+          <section className="panel mt-4 p-4 border-accent/20 bg-secondary/30">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              {/* Play / Pause / Restart */}
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant={isPlaying ? "default" : "outline"}
+                  onClick={() => {
+                    if (isPlaying) {
+                      setIsPlaying(false);
+                    } else {
+                      if (replayTimeMs === null || replayTimeMs >= totalDurationMs) {
+                        setReplayTimeMs(0);
+                      }
+                      setIsPlaying(true);
+                    }
+                  }}
+                  className="h-9 gap-2 rounded-full px-4 font-mono text-xs font-semibold"
+                >
+                  {isPlaying ? (
+                    <>
+                      <Pause className="size-3.5 fill-current" />
+                      Pause
+                    </>
+                  ) : (
+                    <>
+                      <Play className="size-3.5 fill-current ml-0.5" />
+                      {replayTimeMs !== null && replayTimeMs < totalDurationMs
+                        ? "Resume"
+                        : "Play Replay"}
+                    </>
+                  )}
+                </Button>
+
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => {
+                    setReplayTimeMs(0);
+                  }}
+                  title="Restart from beginning"
+                  className="h-9 w-9 rounded-full text-muted-foreground hover:text-foreground"
+                >
+                  <RotateCcw className="size-4" />
+                </Button>
+
+                {isReplaying && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setReplayTimeMs(null);
+                    }}
+                    className="h-8 text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    Exit Replay
+                  </Button>
+                )}
+              </div>
+
+              {/* Scrubber slider and time display */}
+              <div className="flex flex-1 items-center gap-3 min-w-[240px]">
+                <span className="font-mono text-xs text-muted-foreground w-20 shrink-0 text-right">
+                  {formatLapTime(replayTimeMs ?? totalDurationMs)}
+                </span>
+                <Slider
+                  value={[Math.min(totalDurationMs, Math.max(0, replayTimeMs ?? totalDurationMs))]}
+                  min={0}
+                  max={totalDurationMs}
+                  step={16}
+                  onValueChange={(val) => {
+                    const t = val[0] ?? 0;
+                    setReplayTimeMs(t);
+                  }}
+                  className="flex-1 cursor-pointer"
+                />
+                <span className="font-mono text-xs text-muted-foreground w-20 shrink-0">
+                  {formatLapTime(totalDurationMs)}
+                </span>
+              </div>
+
+              {/* Speed Multiplier (1x, 2x, 4x) & 60 FPS indicator */}
+              <div className="flex items-center gap-1.5">
+                <span className="font-mono text-[10px] text-muted-foreground uppercase tracking-wider hidden sm:inline mr-1">
+                  Speed:
+                </span>
+                {[1, 2, 4].map((spd) => (
+                  <Button
+                    key={spd}
+                    size="sm"
+                    variant={replaySpeed === spd ? "default" : "secondary"}
+                    onClick={() => setReplaySpeed(spd)}
+                    className="h-7 w-8 p-0 font-mono text-xs rounded"
+                  >
+                    {spd}x
+                  </Button>
+                ))}
+                <span className="ml-2 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent font-medium">
+                  60 FPS
+                </span>
+              </div>
+            </div>
+          </section>
+        )}
+
         {/* Map + G-G */}
         <section className="mt-3 grid gap-3 md:grid-cols-2">
 
@@ -697,9 +971,14 @@ function Index() {
                       ? `Lap ${liveFrame.current_lap} · Pe traseul creat`
                       : "Lap 1 · Creare traseu live"}
                   </span>
+                ) : isReplaying ? (
+                  <span className="flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-3 py-1 font-mono text-xs text-accent">
+                    <span className={`size-2 rounded-full bg-accent ${isPlaying ? "animate-pulse" : ""}`} />
+                    Replay · {formatLapTime(replayTimeMs ?? 0)}
+                  </span>
                 ) : (
                   <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                    {projectedTrack.length > 0 ? `${projectedTrack.length} pts` : "No data"}
+                    {fullProjectedTrack.length > 0 ? `${fullProjectedTrack.length} pts` : "No data"}
                   </span>
                 )}
                 {selectedLapId && (
@@ -711,8 +990,30 @@ function Index() {
             </div>
 
             <svg viewBox="0 0 400 220" className="mt-4 w-full select-none">
-              {projectedTrack.length > 1 ? (
+              {fullProjectedTrack.length > 1 ? (
                 <>
+                  {/* Faint Ghost Track Outline when Replaying (to see full circuit ahead) */}
+                  {isReplaying && (
+                    <>
+                      <polyline
+                        points={fullProjectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                        fill="none"
+                        stroke="rgba(255, 255, 255, 0.05)"
+                        strokeWidth="15"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                      <polyline
+                        points={fullProjectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
+                        fill="none"
+                        stroke="rgba(255, 255, 255, 0.02)"
+                        strokeWidth="11"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </>
+                  )}
+
                   {/* Road Corridor Outer Border / Curbs (Traseu cu lățime reală) */}
                   <polyline
                     points={projectedTrack.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")}
@@ -775,21 +1076,8 @@ function Index() {
                     />
                   )}
 
-                  {/* Apex Markers */}
-                  {projectedTrack
-                    .filter((p) => p.apex === 1)
-                    .map((p, i) => (
-                      <circle
-                        key={`apex-${i}`}
-                        cx={p.x}
-                        cy={p.y}
-                        r="3.5"
-                        fill="#f97316"
-                        opacity="0.85"
-                      />
-                    ))}
 
-                  {/* Live Car Dot (Snaps to established track from Lap 2+, tracks leading edge on Lap 1) */}
+                  {/* Car Dot (Replay mode or Live mode) */}
                   {carDot && (
                     <g>
                       <circle
@@ -838,7 +1126,7 @@ function Index() {
 
             <div className="mt-3 flex justify-between font-mono text-xs text-muted-foreground">
               <span>
-                Peak speed{" "}
+                {isReplaying ? "Speed " : "Peak speed "}
                 <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
               </span>
               <div className="flex items-center gap-3">
@@ -861,7 +1149,7 @@ function Index() {
             <div className="flex justify-between">
               <h2 className="font-medium">G-G diagram</h2>
               <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                {isCurrentSessionLive && liveFrame
+                {(isCurrentSessionLive && liveFrame) || isReplaying
                   ? `Total G ${totalG.toFixed(2)}`
                   : `${gSample.length} samples`}
               </span>
@@ -890,23 +1178,24 @@ function Index() {
               <line x1="10" y1="110" x2="210" y2="110" stroke="var(--border)" />
               <line x1="110" y1="10" x2="110" y2="210" stroke="var(--border)" />
 
-              {/* Scatter dots from telemetry */}
-              {gSample.map((p, i) => {
-                const cx = Math.max(10, Math.min(210, 110 + p.g_lat * 52));
-                const cy = Math.max(10, Math.min(210, 110 - p.g_lon * 47));
-                return (
-                  <circle
-                    key={i}
-                    cx={cx}
-                    cy={cy}
-                    r="1.8"
-                    fill="var(--accent)"
-                    opacity="0.45"
-                  />
-                );
-              })}
+              {/* Scatter dots from telemetry (hidden during Replay, shown in normal/exit view) */}
+              {!isReplaying &&
+                gSample.map((p, i) => {
+                  const cx = Math.max(10, Math.min(210, 110 + p.g_lat * 52));
+                  const cy = Math.max(10, Math.min(210, 110 - p.g_lon * 47));
+                  return (
+                    <circle
+                      key={i}
+                      cx={cx}
+                      cy={cy}
+                      r="1.8"
+                      fill="var(--accent)"
+                      opacity="0.45"
+                    />
+                  );
+                })}
 
-              {/* Live needle & indicator */}
+              {/* Indicator: Live mode has needle line, Replay mode has only the moving point without line, Exit/Static has center dot */}
               {isCurrentSessionLive ? (
                 <>
                   <line
@@ -926,6 +1215,26 @@ function Index() {
                     strokeWidth="3"
                   />
                 </>
+              ) : isReplaying ? (
+                <g>
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="10"
+                    fill="none"
+                    stroke="var(--accent)"
+                    strokeWidth="1.5"
+                    opacity="0.3"
+                  />
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="6"
+                    fill="var(--accent)"
+                    stroke="#09090b"
+                    strokeWidth="2"
+                  />
+                </g>
               ) : (
                 <circle
                   cx="110"
@@ -941,7 +1250,7 @@ function Index() {
               <span>
                 Lateral{" "}
                 <b className="text-accent">
-                  {isCurrentSessionLive
+                  {isCurrentSessionLive || isReplaying
                     ? `${currentGLat >= 0 ? "+" : ""}${currentGLat.toFixed(2)} G`
                     : `+${maxGLat.toFixed(2)} G max`}
                 </b>
@@ -949,7 +1258,7 @@ function Index() {
               <span>
                 Longitudinal{" "}
                 <b className="text-destructive">
-                  {isCurrentSessionLive
+                  {isCurrentSessionLive || isReplaying
                     ? `${currentGLon >= 0 ? "+" : "−"}${Math.abs(currentGLon).toFixed(2)} G`
                     : `−${maxGBrake.toFixed(2)} G max brk`}
                 </b>
