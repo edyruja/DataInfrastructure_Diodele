@@ -10,732 +10,446 @@ import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
+  Alert,
 } from 'react-native';
 import * as Location from 'expo-location';
-import { DeviceMotion, Gyroscope } from 'expo-sensors';
+import { DeviceMotion } from 'expo-sensors';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
+// ─── VERSIUNE: v2.1 – build stabil pentru juriu ───────────────────────────────
+const APP_VERSION = 'v2.1';
 const BASE_WS_URL = 'wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws';
 
-// Circuit Cluj Demo Waypoints pentru Simulator (buclă închisă de ~1.8 km)
-const SIM_TRACK_WAYPOINTS = [
-  { lat: 46.77000, lon: 23.60000, speed: 195, gLat: 0.1,  gBrake: 0,    apex: 0 }, // Linia dreaptă start/sosire
-  { lat: 46.77120, lon: 23.60040, speed: 225, gLat: 0.2,  gBrake: 0,    apex: 0 },
-  { lat: 46.77240, lon: 23.60080, speed: 235, gLat: 0.1,  gBrake: 0.8,  apex: 0 }, // Frânare Turn 1
-  { lat: 46.77320, lon: 23.60150, speed: 110, gLat: 1.35, gBrake: 0.3,  apex: 1 }, // Turn 1 Apex
-  { lat: 46.77380, lon: 23.60280, speed: 140, gLat: 0.85, gBrake: 0,    apex: 0 },
-  { lat: 46.77450, lon: 23.60420, speed: 175, gLat: 0.3,  gBrake: 0,    apex: 0 }, // Sector 2
-  { lat: 46.77530, lon: 23.60600, speed: 210, gLat: 0.15, gBrake: 1.1,  apex: 0 }, // Frânare Ac de păr
-  { lat: 46.77550, lon: 23.60680, speed: 82,  gLat: 1.65, gBrake: 0.2,  apex: 1 }, // Hairpin Apex
-  { lat: 46.77480, lon: 23.60740, speed: 120, gLat: 0.9,  gBrake: 0,    apex: 0 },
-  { lat: 46.77360, lon: 23.60660, speed: 165, gLat: 0.4,  gBrake: 0,    apex: 0 }, // Șicane
-  { lat: 46.77250, lon: 23.60520, speed: 135, gLat: 1.25, gBrake: 0.1,  apex: 1 }, // Chicane Apex
-  { lat: 46.77150, lon: 23.60350, speed: 180, gLat: 0.5,  gBrake: 0,    apex: 0 },
-  { lat: 46.77060, lon: 23.60180, speed: 190, gLat: 0.2,  gBrake: 0.3,  apex: 0 }, // Ultimul viraj
-  { lat: 46.77010, lon: 23.60060, speed: 170, gLat: 0.8,  gBrake: 0,    apex: 1 },
+// Circuit Cluj – 14 jaloane, buclă ~1.8 km
+const SIM_WAYPOINTS = [
+  { lat: 46.77000, lon: 23.60000, spd: 195, gL: 0.10, gB: 0.0 },
+  { lat: 46.77120, lon: 23.60040, spd: 225, gL: 0.20, gB: 0.0 },
+  { lat: 46.77240, lon: 23.60080, spd: 235, gL: 0.10, gB: 0.8 },
+  { lat: 46.77320, lon: 23.60150, spd: 110, gL: 1.35, gB: 0.3 },
+  { lat: 46.77380, lon: 23.60280, spd: 140, gL: 0.85, gB: 0.0 },
+  { lat: 46.77450, lon: 23.60420, spd: 175, gL: 0.30, gB: 0.0 },
+  { lat: 46.77530, lon: 23.60600, spd: 210, gL: 0.15, gB: 1.1 },
+  { lat: 46.77550, lon: 23.60680, spd: 82,  gL: 1.65, gB: 0.2 },
+  { lat: 46.77480, lon: 23.60740, spd: 120, gL: 0.90, gB: 0.0 },
+  { lat: 46.77360, lon: 23.60660, spd: 165, gL: 0.40, gB: 0.0 },
+  { lat: 46.77250, lon: 23.60520, spd: 135, gL: 1.25, gB: 0.1 },
+  { lat: 46.77150, lon: 23.60350, spd: 180, gL: 0.50, gB: 0.0 },
+  { lat: 46.77060, lon: 23.60180, spd: 190, gL: 0.20, gB: 0.3 },
+  { lat: 46.77010, lon: 23.60060, spd: 170, gL: 0.80, gB: 0.0 },
 ];
 
 export default function App() {
-  // Preset implicit adaptat platformei (iPhone vs Android)
-  const defaultDriver = Platform.OS === 'ios' ? 'Cristi - iPhone' : 'Alex - S23';
-  const [driverName, setDriverName] = useState(defaultDriver);
-  const [trackName, setTrackName] = useState('Circuit-Cluj');
-  const [isSimulatorMode, setIsSimulatorMode] = useState(false);
-  const [isRunning, setIsRunning] = useState(false);
-  const [statusText, setStatusText] = useState('Pregătit');
+  const isIOS = Platform.OS === 'ios';
+  const defaultDriver = isIOS ? 'Cristi - iPhone' : 'Alex - S23';
 
-  // Metrici live afișate pe ecranul telefonului
-  const [liveStats, setLiveStats] = useState({
-    speedKmh: 0,
-    gForce: 0,
-    pointsSent: 0,
-  });
+  const [driverName, setDriverName]       = useState(defaultDriver);
+  const [trackName,  setTrackName]        = useState('Circuit-Cluj');
+  const [simMode,    setSimMode]          = useState(false);
+  const [running,    setRunning]          = useState(false);
+  const [status,     setStatus]           = useState('Pregătit ' + APP_VERSION);
+  const [elapsed,    setElapsed]          = useState(0);   // secunde, pentru cronometru
+  const [speed,      setSpeed]            = useState(0);
+  const [gForce,     setGForce]           = useState(0);
+  const [points,     setPoints]           = useState(0);
 
-  const ws = useRef(null);
-  const isRunningRef = useRef(false);
-  const isSimulatorModeRef = useRef(false);
-  const imuBuffer = useRef([]);
-  const retryQueue = useRef([]);
-  const latestGps = useRef({ lat: 46.77000, lon: 23.60000, speed: 0, bearing: 0 });
-  const latestGyro = useRef({ x: 0, y: 0, z: 0 });
-  const sessionIdRef = useRef('');
-  const pointsSentCounter = useRef(0);
-  const simStepRef = useRef(0);
+  // refs
+  const wsRef         = useRef(null);
+  const runRef        = useRef(false);
+  const simRef        = useRef(false);
+  const gpsRef        = useRef({ lat: 0, lon: 0, speed: 0, bearing: 0 });
+  const imuBuf        = useRef([]);
+  const retryBuf      = useRef([]);
+  const sessionRef    = useRef('');
+  const ptsCnt        = useRef(0);
+  const simStep       = useRef(0);
+  const startTime     = useRef(0);
 
+  // ── cronometru afișat pe ecran ──────────────────────────────────────────────
   useEffect(() => {
-    isRunningRef.current = isRunning;
-    isSimulatorModeRef.current = isSimulatorMode;
-    let locSub = null;
-    let accelSub = null;
-    let gyroSub = null;
-    let sendInterval = null;
-    let simInterval = null;
-    let reconnectTimeout = null;
+    if (!running) { setElapsed(0); return; }
+    startTime.current = Date.now();
+    const t = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime.current) / 1000));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [running]);
 
-    const flushRetryQueue = () => {
-      while (retryQueue.current.length > 0 && ws.current && ws.current.readyState === WebSocket.OPEN) {
-        const queued = retryQueue.current.shift();
+  // ── logica principală telemetrie ────────────────────────────────────────────
+  useEffect(() => {
+    runRef.current = running;
+    simRef.current = simMode;
+
+    if (!running) {
+      stopAll();
+      return;
+    }
+
+    let locSub   = null;
+    let motSub   = null;
+    let simInt   = null;
+    let sendInt  = null;
+    let recoTmo  = null;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+    const sendMsg = (payload) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         try {
-          ws.current.send(JSON.stringify(queued));
-          pointsSentCounter.current += queued.samples ? queued.samples.length : 1;
-        } catch (err) {
-          retryQueue.current.unshift(queued);
-          break;
-        }
+          wsRef.current.send(JSON.stringify(payload));
+          if (payload.samples) {
+            ptsCnt.current += payload.samples.length;
+            setPoints(ptsCnt.current);
+          }
+          return true;
+        } catch (_) {}
+      }
+      retryBuf.current.push(payload);
+      if (retryBuf.current.length > 400) retryBuf.current.shift();
+      return false;
+    };
+
+    const flushRetry = () => {
+      while (
+        retryBuf.current.length > 0 &&
+        wsRef.current &&
+        wsRef.current.readyState === WebSocket.OPEN
+      ) {
+        const p = retryBuf.current.shift();
+        try { wsRef.current.send(JSON.stringify(p)); ptsCnt.current += (p.samples||[]).length; setPoints(ptsCnt.current); }
+        catch (_) { retryBuf.current.unshift(p); break; }
       }
     };
 
-    const connectWebSocket = () => {
-      if (!isRunningRef.current) return;
+    const makePayload = (samples) => ({
+      session_id:  sessionRef.current,
+      device_id:   driverName.trim() || defaultDriver,
+      track_name:  trackName.trim()  || 'Circuit-Cluj',
+      event_type:  'telemetry_batch',
+      timestamp:   new Date().toISOString(),
+      unit: { accel: 'g', gyro: 'rad/s', speed: 'm/s', bearing: 'deg' },
+      gps:     gpsRef.current,
+      samples,
+      value: { gps: gpsRef.current, samples },
+    });
 
-      const cleanTrack = encodeURIComponent(trackName.trim() || 'Default-Track');
-      const cleanDriver = encodeURIComponent(driverName.trim() || defaultDriver);
-      const fullUrl = `${BASE_WS_URL}?session=${sessionIdRef.current}&track=${cleanTrack}&device=${cleanDriver}`;
+    // ── WebSocket ─────────────────────────────────────────────────────────────
+    const connect = () => {
+      if (!runRef.current) return;
+      const sess  = encodeURIComponent(sessionRef.current);
+      const track = encodeURIComponent(trackName.trim() || 'Circuit-Cluj');
+      const drv   = encodeURIComponent(driverName.trim() || defaultDriver);
+      const url   = `${BASE_WS_URL}?session=${sess}&track=${track}&device=${drv}`;
+      setStatus('Conectare...');
+      const socket = new WebSocket(url);
+      wsRef.current = socket;
 
-      setStatusText('Conectare la Cloud...');
-      ws.current = new WebSocket(fullUrl);
-
-      ws.current.onopen = () => {
-        const modeLabel = isSimulatorModeRef.current ? 'SIMULATOR F1' : 'LIVE SENZORI';
-        setStatusText(`● LIVE (${modeLabel})`);
-        flushRetryQueue();
-      };
-
-      ws.current.onerror = () => {
-        setStatusText('Reconectare...');
-      };
-
-      ws.current.onclose = () => {
-        if (isRunningRef.current) {
-          const qCount = retryQueue.current.length;
-          setStatusText(
-            qCount > 0
-              ? `Buffer offline (${qCount}) - Reconectare...`
-              : 'Semnal slab - Reconectare...'
-          );
-          reconnectTimeout = setTimeout(connectWebSocket, 1000);
+      socket.onopen  = () => { setStatus(`● LIVE ${simRef.current ? 'SIMULATOR' : 'GPS'}`); flushRetry(); };
+      socket.onerror = () => setStatus('Eroare WS – reconectare...');
+      socket.onclose = () => {
+        if (runRef.current) {
+          setStatus(`Buffer(${retryBuf.current.length}) – reconectare...`);
+          recoTmo = setTimeout(connect, 1500);
         }
       };
     };
 
-    const startTelemetry = async () => {
-      await activateKeepAwakeAsync().catch(() => {});
+    // ── init sesiune ──────────────────────────────────────────────────────────
+    const cleanTag = (driverName.trim() || defaultDriver).replace(/[^a-zA-Z0-9]/g, '_');
+    sessionRef.current = `ses_${cleanTag}_${Date.now()}`;
+    imuBuf.current  = [];
+    retryBuf.current = [];
+    ptsCnt.current   = 0;
+    simStep.current  = 0;
+    setPoints(0);
 
-      // Generare Session ID unic ce include numele pilotului pentru a preveni coliziunile multi-user
-      const cleanTag = (driverName.trim() || defaultDriver).replace(/[^a-zA-Z0-9]/g, '_');
-      sessionIdRef.current = `ses_${cleanTag}_${Date.now()}`;
-      imuBuffer.current = [];
-      retryQueue.current = [];
-      pointsSentCounter.current = 0;
-      simStepRef.current = 0;
+    // pre-init GPS cu primul waypoint în mod simulator (evită speed=0 la start)
+    if (simMode) {
+      const w0 = SIM_WAYPOINTS[0];
+      const w1 = SIM_WAYPOINTS[1];
+      const dl = w1.lon - w0.lon;
+      const y  = Math.sin(dl) * Math.cos(w1.lat);
+      const x  = Math.cos(w0.lat) * Math.sin(w1.lat) - Math.sin(w0.lat) * Math.cos(w1.lat) * Math.cos(dl);
+      gpsRef.current = { lat: w0.lat, lon: w0.lon, speed: w0.spd / 3.6, bearing: (Math.atan2(y, x) * 180 / Math.PI + 360) % 360 };
+    }
 
-      // Dacă e mod simulator, inițializăm GPS cu primul waypoint ÎNAINTE de connect
-      // astfel primul batch trimis are speed corect (nu 0)
-      if (isSimulatorModeRef.current) {
-        const wp0 = SIM_TRACK_WAYPOINTS[0];
-        const wp1 = SIM_TRACK_WAYPOINTS[1];
-        const dLon0 = wp1.lon - wp0.lon;
-        const y0 = Math.sin(dLon0) * Math.cos(wp1.lat);
-        const x0 = Math.cos(wp0.lat) * Math.sin(wp1.lat) - Math.sin(wp0.lat) * Math.cos(wp1.lat) * Math.cos(dLon0);
-        const initBearing = (Math.atan2(y0, x0) * (180 / Math.PI) + 360) % 360;
-        latestGps.current = {
-          lat: wp0.lat,
-          lon: wp0.lon,
-          speed: wp0.speed / 3.6, // km/h → m/s
-          bearing: initBearing,
-        };
-      }
+    activateKeepAwakeAsync().catch(() => {});
+    connect();
 
-      connectWebSocket();
+    // ── mod SIMULATOR ─────────────────────────────────────────────────────────
+    if (simMode) {
+      simInt = setInterval(() => {
+        if (!runRef.current) return;
+        const N   = SIM_WAYPOINTS.length;
+        const idx = Math.floor(simStep.current) % N;
+        const nxt = (idx + 1) % N;
+        const p   = simStep.current - Math.floor(simStep.current);
+        const w1  = SIM_WAYPOINTS[idx];
+        const w2  = SIM_WAYPOINTS[nxt];
 
-      if (isSimulatorModeRef.current) {
-        // ── MOD SIMULATOR F1 (permite generare simultană pentru juriu fără GPS fizic) ──
-        simInterval = setInterval(() => {
-          if (!isRunningRef.current) return;
+        const lat  = w1.lat + (w2.lat - w1.lat) * p;
+        const lon  = w1.lon + (w2.lon - w1.lon) * p;
+        const spdK = w1.spd + (w2.spd - w1.spd) * p;
+        const spdM = spdK / 3.6;
+        const dl   = w2.lon - w1.lon;
+        const y    = Math.sin(dl) * Math.cos(w2.lat);
+        const x    = Math.cos(w1.lat) * Math.sin(w2.lat) - Math.sin(w1.lat) * Math.cos(w2.lat) * Math.cos(dl);
+        const brg  = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 
-          const totalWp = SIM_TRACK_WAYPOINTS.length;
-          const currentIdx = Math.floor(simStepRef.current) % totalWp;
-          const nextIdx = (currentIdx + 1) % totalWp;
-          const progress = simStepRef.current - Math.floor(simStepRef.current);
+        gpsRef.current = { lat, lon, speed: spdM, bearing: brg };
 
-          const wp1 = SIM_TRACK_WAYPOINTS[currentIdx];
-          const wp2 = SIM_TRACK_WAYPOINTS[nextIdx];
+        const gL  = w1.gL + (w2.gL - w1.gL) * p + (Math.random() - 0.5) * 0.08;
+        const gB  = w1.gB + (w2.gB - w1.gB) * p;
 
-          // Interpolare lină GPS între jaloane
-          const lat = wp1.lat + (wp2.lat - wp1.lat) * progress;
-          const lon = wp1.lon + (wp2.lon - wp1.lon) * progress;
-          const speedKmh = wp1.speed + (wp2.speed - wp1.speed) * progress;
-          const speedMs = speedKmh / 3.6;
+        imuBuf.current.push({
+          ts: Date.now(),
+          ax: +gL.toFixed(3),
+          ay: +(gB > 0 ? -gB : 0.35).toFixed(3),
+          az: 0.98,
+          gx: 0, gy: 0,
+          gz: +(gL * 0.45).toFixed(3),
+        });
 
-          // Calcul unghi direcție (bearing)
-          const dLon = wp2.lon - wp1.lon;
-          const y = Math.sin(dLon) * Math.cos(wp2.lat);
-          const x = Math.cos(wp1.lat) * Math.sin(wp2.lat) - Math.sin(wp1.lat) * Math.cos(wp2.lat) * Math.cos(dLon);
-          const bearing = (Math.atan2(y, x) * (180 / Math.PI) + 360) % 360;
+        setSpeed(Math.round(spdK));
+        setGForce(+Math.abs(gL).toFixed(2));
+        simStep.current += 0.08;
+      }, 80);
 
-          latestGps.current = { lat, lon, speed: speedMs, bearing };
-
-          // Generare mostre IMU simulate (Forțe G laterale și de frânare realiste)
-          const gLat = wp1.gLat + (wp2.gLat - wp1.gLat) * progress + (Math.random() - 0.5) * 0.08;
-          const gBrake = wp1.gBrake + (wp2.gBrake - wp1.gBrake) * progress;
-          const gLon = gBrake > 0 ? -gBrake : 0.35; // Accelerație pozitivă la ieșire din viraj
-
-          imuBuffer.current.push({
-            ts: Date.now(),
-            ax: Number(gLat.toFixed(3)),
-            ay: Number(gLon.toFixed(3)),
-            az: 0.98,
-            gx: 0,
-            gy: 0,
-            gz: Number((gLat * 0.45).toFixed(3)),
-          });
-
-          // Actualizare HUD ecran
-          setLiveStats({
-            speedKmh: Math.round(speedKmh),
-            gForce: Number(Math.abs(gLat).toFixed(2)),
-            pointsSent: pointsSentCounter.current,
-          });
-
-          // Pas de înaintare pe circuit
-          simStepRef.current += 0.08;
-        }, 80);
-
-      } else {
-        // ── MOD SENZORI REALI (compatibil 100% cu iPhone / iOS și Android) ──
-        const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-          setStatusText('Eroare: Permisiune GPS necesară!');
-          setIsRunning(false);
-          return;
+    // ── mod GPS REAL ──────────────────────────────────────────────────────────
+    } else {
+      (async () => {
+        const { status: s } = await Location.requestForegroundPermissionsAsync();
+        if (s !== 'granted') {
+          Alert.alert('Permisiune refuzată', 'GPS-ul este necesar pentru telemetrie.');
+          setRunning(false); return;
         }
-
         locSub = await Location.watchPositionAsync(
-          {
-            accuracy: Location.Accuracy.BestForNavigation,
-            timeInterval: 100,
-            distanceInterval: 0,
-          },
-          (location) => {
-            if (!location || !location.coords) return;
-            const spd = location.coords.speed && location.coords.speed > 0 ? location.coords.speed : 0;
-            latestGps.current = {
-              lat: location.coords.latitude,
-              lon: location.coords.longitude,
-              speed: spd,
-              bearing: location.coords.heading || 0,
+          { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 100, distanceInterval: 0 },
+          (loc) => {
+            if (!loc?.coords) return;
+            const spd = loc.coords.speed > 0 ? loc.coords.speed : 0;
+            gpsRef.current = {
+              lat:     loc.coords.latitude,
+              lon:     loc.coords.longitude,
+              speed:   spd,
+              bearing: loc.coords.heading || 0,
             };
-            setLiveStats((prev) => ({
-              ...prev,
-              speedKmh: Math.round(spd * 3.6),
-            }));
+            setSpeed(Math.round(spd * 3.6));
           }
         );
 
-        Gyroscope.setUpdateInterval(20);
-        gyroSub = Gyroscope.addListener((gyro) => {
-          if (gyro) {
-            latestGyro.current = {
-              x: typeof gyro.x === 'number' ? gyro.x : 0,
-              y: typeof gyro.y === 'number' ? gyro.y : 0,
-              z: typeof gyro.z === 'number' ? gyro.z : 0,
-            };
-          }
-        });
-
         DeviceMotion.setUpdateInterval(20);
-        accelSub = DeviceMotion.addListener((motion) => {
-          if (!motion) return;
+        motSub = DeviceMotion.addListener((m) => {
+          if (!m) return;
+          const G = 9.80665;
+          let ax = 0, ay = 0, az = 0;
+          const hasL = m.acceleration && typeof m.acceleration.x === 'number';
+          const hasG = m.accelerationIncludingGravity && typeof m.accelerationIncludingGravity.x === 'number';
 
-          let calX = 0;
-          let calY = 0;
-          let calZ = 0;
-          const G_CONST = 9.80665;
-
-          // Extragere sigură a accelerației (compatibilă cu CoreMotion pe iOS și Sensor API pe Android)
-          const hasLinear = motion.acceleration && typeof motion.acceleration.x === 'number';
-          const hasGravity = motion.accelerationIncludingGravity && typeof motion.accelerationIncludingGravity.x === 'number';
-
-          if (hasLinear && hasGravity) {
-            const gx = motion.accelerationIncludingGravity.x - motion.acceleration.x;
-            const gy = motion.accelerationIncludingGravity.y - motion.acceleration.y;
-            const gz = motion.accelerationIncludingGravity.z - motion.acceleration.z;
-            const gNorm = Math.sqrt(gx * gx + gy * gy + gz * gz) || G_CONST;
-
-            const upX = gx / gNorm;
-            const upY = gy / gNorm;
-            const upZ = gz / gNorm;
-
-            const ax = motion.acceleration.x;
-            const ay = motion.acceleration.y;
-            const az = motion.acceleration.z;
-
-            // Proiecție dinamică pe plan orizontal
-            const aVertical = ax * upX + ay * upY + az * upZ;
-            calX = (ax - aVertical * upX) / G_CONST;
-            calY = (ay - aVertical * upY) / G_CONST;
-            calZ = (az - aVertical * upZ) / G_CONST;
-          } else if (hasGravity) {
-            calX = (motion.accelerationIncludingGravity.x || 0) / G_CONST;
-            calY = (motion.accelerationIncludingGravity.y || 0) / G_CONST;
-            calZ = (motion.accelerationIncludingGravity.z || 0) / G_CONST;
+          if (hasL && hasG) {
+            const gx = m.accelerationIncludingGravity.x - m.acceleration.x;
+            const gy = m.accelerationIncludingGravity.y - m.acceleration.y;
+            const gz = m.accelerationIncludingGravity.z - m.acceleration.z;
+            const gN = Math.sqrt(gx*gx + gy*gy + gz*gz) || G;
+            const ux = gx/gN, uy = gy/gN, uz = gz/gN;
+            const aV = m.acceleration.x*ux + m.acceleration.y*uy + m.acceleration.z*uz;
+            ax = (m.acceleration.x - aV*ux) / G;
+            ay = (m.acceleration.y - aV*uy) / G;
+            az = (m.acceleration.z - aV*uz) / G;
+          } else if (hasG) {
+            ax = (m.accelerationIncludingGravity.x || 0) / G;
+            ay = (m.accelerationIncludingGravity.y || 0) / G;
+            az = (m.accelerationIncludingGravity.z || 0) / G;
           }
 
-          imuBuffer.current.push({
+          imuBuf.current.push({
             ts: Date.now(),
-            ax: Number(calX.toFixed(4)),
-            ay: Number(calY.toFixed(4)),
-            az: Number(calZ.toFixed(4)),
-            gx: Number((latestGyro.current.x || 0).toFixed(4)),
-            gy: Number((latestGyro.current.y || 0).toFixed(4)),
-            gz: Number((latestGyro.current.z || 0).toFixed(4)),
+            ax: +ax.toFixed(4), ay: +ay.toFixed(4), az: +az.toFixed(4),
+            gx: 0, gy: 0, gz: 0,
           });
-
-          if (imuBuffer.current.length > 500) {
-            imuBuffer.current.shift();
-          }
-
-          setLiveStats((prev) => ({
-            ...prev,
-            gForce: Number(Math.abs(calX).toFixed(2)),
-          }));
+          if (imuBuf.current.length > 500) imuBuf.current.shift();
+          setGForce(+Math.abs(ax).toFixed(2));
         });
-      }
-
-      // Interval de trimitere loturi telemetrie (la fiecare 200ms)
-      sendInterval = setInterval(() => {
-        if (imuBuffer.current.length === 0 && retryQueue.current.length === 0) return;
-
-        let payload = null;
-        if (imuBuffer.current.length > 0) {
-          const samplesToSend = [...imuBuffer.current];
-          imuBuffer.current = [];
-
-          payload = {
-            session_id: sessionIdRef.current,
-            device_id: driverName.trim() || defaultDriver,
-            track_name: trackName.trim() || 'Circuit-Cluj',
-            event_type: 'telemetry_batch',
-            timestamp: new Date().toISOString(),
-            unit: {
-              accel: 'g',
-              gyro: 'rad/s',
-              speed: 'm/s',
-              bearing: 'deg',
-            },
-            value: {
-              gps: latestGps.current,
-              samples: samplesToSend,
-            },
-            gps: latestGps.current,
-            samples: samplesToSend,
-          };
-        }
-
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          flushRetryQueue();
-          if (payload) {
-            try {
-              ws.current.send(JSON.stringify(payload));
-              pointsSentCounter.current += payload.samples.length;
-              setLiveStats((prev) => ({ ...prev, pointsSent: pointsSentCounter.current }));
-            } catch (err) {
-              retryQueue.current.push(payload);
-            }
-          }
-        } else if (payload) {
-          retryQueue.current.push(payload);
-          if (retryQueue.current.length > 300) {
-            retryQueue.current.shift();
-          }
-          if (isRunningRef.current) {
-            setStatusText(`Buffer offline (${retryQueue.current.length}) - Reconectare...`);
-          }
-        }
-      }, 200);
-    };
-
-    const stopTelemetry = () => {
-      const stopPayload = {
-        session_id: sessionIdRef.current,
-        device_id: driverName.trim() || defaultDriver,
-        event_type: 'STOP_SESSION',
-        timestamp: new Date().toISOString(),
-        unit: 'event',
-        value: 'session_completed',
-      };
-
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        flushRetryQueue();
-        try {
-          ws.current.send(JSON.stringify(stopPayload));
-        } catch (e) {
-          console.warn('Failed to send STOP_SESSION', e);
-        }
-        ws.current.close();
-      } else if (ws.current) {
-        ws.current.close();
-      }
-      deactivateKeepAwake();
-      if (sessionIdRef.current) {
-        setStatusText('Sesiune finalizată și salvată');
-      } else {
-        setStatusText('Pregătit');
-      }
-    };
-
-    if (isRunning) {
-      startTelemetry();
-    } else {
-      stopTelemetry();
+      })();
     }
 
-    return () => {
-      if (locSub) locSub.remove();
-      if (accelSub) accelSub.remove();
-      if (gyroSub) gyroSub.remove();
-      if (sendInterval) clearInterval(sendInterval);
-      if (simInterval) clearInterval(simInterval);
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (ws.current) ws.current.close();
-      deactivateKeepAwake();
-    };
-  }, [isRunning]);
+    // ── interval trimitere (200ms) ────────────────────────────────────────────
+    sendInt = setInterval(() => {
+      if (imuBuf.current.length === 0 && retryBuf.current.length === 0) return;
+      if (imuBuf.current.length > 0) {
+        const batch = [...imuBuf.current];
+        imuBuf.current = [];
+        sendMsg(makePayload(batch));
+      }
+      flushRetry();
+    }, 200);
 
+    // ── cleanup ───────────────────────────────────────────────────────────────
+    return () => {
+      clearInterval(simInt);
+      clearInterval(sendInt);
+      clearTimeout(recoTmo);
+      if (locSub) locSub.remove();
+      if (motSub) motSub.remove();
+    };
+  }, [running]);
+
+  const stopAll = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.send(JSON.stringify({
+          session_id: sessionRef.current,
+          device_id:  driverName,
+          event_type: 'STOP_SESSION',
+          timestamp:  new Date().toISOString(),
+          unit: 'event', value: 'session_completed',
+        }));
+      } catch (_) {}
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    deactivateKeepAwake();
+    setStatus('Sesiune salvată ✓ ' + APP_VERSION);
+    setSpeed(0); setGForce(0);
+  };
+
+  const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+
+  // ── UI ────────────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" />
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.inner}
-      >
-        <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-          {/* Header */}
-          <View style={styles.header}>
-            <Text style={styles.brandTitle}>F1 TELEMETRY</Text>
-            <Text style={styles.platformBadge}>
-              {Platform.OS === 'ios' ? '🍎 iOS Device' : '🤖 Android Device'}
-            </Text>
-            <View style={[styles.badge, isRunning ? styles.badgeLive : styles.badgeOff]}>
-              <Text style={[styles.badgeText, isRunning && { color: '#00e676' }]}>
-                {statusText}
-              </Text>
+    <SafeAreaView style={S.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#0d0e12" />
+      <KeyboardAvoidingView behavior={isIOS ? 'padding' : 'height'} style={S.kav}>
+        <ScrollView contentContainerStyle={S.scroll} keyboardShouldPersistTaps="handled">
+
+          {/* HEADER */}
+          <View style={S.header}>
+            <Text style={S.title}>🏎 F1 TELEMETRY</Text>
+            <Text style={S.sub}>{isIOS ? '🍎 iOS' : '🤖 Android'} · {APP_VERSION}</Text>
+            <View style={[S.badge, running ? S.badgeOn : S.badgeOff]}>
+              <Text style={[S.badgeTxt, running && { color: '#00e676' }]}>{status}</Text>
             </View>
           </View>
 
-          {/* HUD Live Telemetrie când este activ */}
-          {isRunning && (
-            <View style={styles.hudCard}>
-              <View style={styles.hudCol}>
-                <Text style={styles.hudValue}>{liveStats.speedKmh}</Text>
-                <Text style={styles.hudLabel}>VITEZĂ (KM/H)</Text>
+          {/* HUD – vizibil doar când rulează */}
+          {running && (
+            <View style={S.hud}>
+              <View style={S.hudCol}>
+                <Text style={S.hudBig}>{fmt(elapsed)}</Text>
+                <Text style={S.hudLbl}>TIMP</Text>
               </View>
-              <View style={styles.hudDivider} />
-              <View style={styles.hudCol}>
-                <Text style={styles.hudValue}>{liveStats.gForce} G</Text>
-                <Text style={styles.hudLabel}>FORȚĂ G</Text>
+              <View style={S.sep} />
+              <View style={S.hudCol}>
+                <Text style={S.hudBig}>{speed}</Text>
+                <Text style={S.hudLbl}>KM/H</Text>
               </View>
-              <View style={styles.hudDivider} />
-              <View style={styles.hudCol}>
-                <Text style={styles.hudValue}>{liveStats.pointsSent}</Text>
-                <Text style={styles.hudLabel}>MOSTRE</Text>
+              <View style={S.sep} />
+              <View style={S.hudCol}>
+                <Text style={S.hudBig}>{gForce}G</Text>
+                <Text style={S.hudLbl}>G-FORCE</Text>
+              </View>
+              <View style={S.sep} />
+              <View style={S.hudCol}>
+                <Text style={S.hudBig}>{points}</Text>
+                <Text style={S.hudLbl}>MOSTRE</Text>
               </View>
             </View>
           )}
 
-          {/* Formular Pilot și Circuit */}
-          <View style={styles.formBox}>
-            <Text style={styles.label}>NUME PILOT</Text>
+          {/* FORMULAR */}
+          <View style={S.card}>
+            <Text style={S.lbl}>PILOT</Text>
             <TextInput
-              style={[styles.input, isRunning && styles.inputLocked]}
-              value={driverName}
-              onChangeText={setDriverName}
-              editable={!isRunning}
+              style={[S.inp, running && S.inpLocked]}
+              value={driverName} onChangeText={setDriverName}
+              editable={!running} placeholderTextColor="#555"
               placeholder="Ex: Cristi - iPhone"
-              placeholderTextColor="#555"
             />
 
-            {/* Selector rapid de profil pilot pentru jurizare / testare simultană */}
-            {!isRunning && (
-              <View style={styles.presetsRow}>
-                <TouchableOpacity
-                  style={[styles.presetBtn, driverName === 'Cristi - iPhone' && styles.presetBtnActive]}
-                  onPress={() => setDriverName('Cristi - iPhone')}
-                >
-                  <Text style={styles.presetText}>Cristi (iPhone)</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.presetBtn, driverName === 'Alex - S23' && styles.presetBtnActive]}
-                  onPress={() => setDriverName('Alex - S23')}
-                >
-                  <Text style={styles.presetText}>Alex (S23)</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.presetBtn, driverName === 'Juriu - Pilot 1' && styles.presetBtnActive]}
-                  onPress={() => setDriverName('Juriu - Pilot 1')}
-                >
-                  <Text style={styles.presetText}>Juriu #1</Text>
-                </TouchableOpacity>
+            {!running && (
+              <View style={S.presets}>
+                {['Cristi - iPhone','Alex - S23','Juriu - Pilot 1'].map(n => (
+                  <TouchableOpacity key={n} style={[S.pre, driverName===n && S.preOn]} onPress={() => setDriverName(n)}>
+                    <Text style={[S.preTxt, driverName===n && S.preTxtOn]}>{n.split(' - ')[0]}</Text>
+                  </TouchableOpacity>
+                ))}
               </View>
             )}
 
-            <Text style={[styles.label, { marginTop: 18 }]}>NUME CIRCUIT</Text>
+            <Text style={[S.lbl,{marginTop:16}]}>CIRCUIT</Text>
             <TextInput
-              style={[styles.input, isRunning && styles.inputLocked]}
-              value={trackName}
-              onChangeText={setTrackName}
-              editable={!isRunning}
+              style={[S.inp, running && S.inpLocked]}
+              value={trackName} onChangeText={setTrackName}
+              editable={!running} placeholderTextColor="#555"
               placeholder="Circuit-Cluj"
-              placeholderTextColor="#555"
             />
 
-            {/* Selector Mod: Senzori Reali vs Simulator */}
-            {!isRunning && (
-              <View style={styles.modeSection}>
-                <Text style={styles.label}>MOD TRANSMISIE TELEMETRIE</Text>
-                <View style={styles.modeToggleRow}>
-                  <TouchableOpacity
-                    style={[styles.modeBtn, !isSimulatorMode && styles.modeBtnActive]}
-                    onPress={() => setIsSimulatorMode(false)}
-                  >
-                    <Text style={[styles.modeBtnText, !isSimulatorMode && styles.modeBtnTextActive]}>
-                      📱 Senzori Reali
-                    </Text>
+            {!running && (
+              <View style={S.modeBox}>
+                <Text style={S.lbl}>MOD TELEMETRIE</Text>
+                <View style={S.modeRow}>
+                  <TouchableOpacity style={[S.modeBtn,!simMode&&S.modeBtnOn]} onPress={() => setSimMode(false)}>
+                    <Text style={[S.modeTxt,!simMode&&S.modeTxtOn]}>📱 Senzori Reali</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.modeBtn, isSimulatorMode && styles.modeBtnActive]}
-                    onPress={() => setIsSimulatorMode(true)}
-                  >
-                    <Text style={[styles.modeBtnText, isSimulatorMode && styles.modeBtnTextActive]}>
-                      🏎️ Simulator Circuit
-                    </Text>
+                  <TouchableOpacity style={[S.modeBtn,simMode&&S.modeBtnOn]} onPress={() => setSimMode(true)}>
+                    <Text style={[S.modeTxt,simMode&&S.modeTxtOn]}>🏎️ Simulator F1</Text>
                   </TouchableOpacity>
                 </View>
-                <Text style={styles.modeHint}>
-                  {isSimulatorMode
-                    ? 'Permite simularea simultană pe circuit chiar din sală.'
-                    : 'Folosește GPS-ul și giroscopul real al telefonului tău.'}
+                <Text style={S.modeHint}>
+                  {simMode ? 'Simulare GPS Circuit Cluj – fără telefon pe mașină.' : 'GPS + giroscop real – telefon pe mașină.'}
                 </Text>
               </View>
             )}
           </View>
+
         </ScrollView>
 
-        {/* Buton principal START / STOP */}
+        {/* BUTON START / STOP */}
         <TouchableOpacity
-          style={[styles.mainButton, isRunning ? styles.btnStop : styles.btnStart]}
-          onPress={() => setIsRunning((prev) => !prev)}
+          style={[S.btn, running ? S.btnStop : S.btnStart]}
+          onPress={() => setRunning(r => !r)}
           activeOpacity={0.85}
         >
-          <Text style={styles.mainButtonText}>
-            {isRunning ? 'STOP TELEMETRIE' : 'START TELEMETRIE'}
-          </Text>
+          <Text style={S.btnTxt}>{running ? '⏹ STOP TELEMETRIE' : '▶ START TELEMETRIE'}</Text>
         </TouchableOpacity>
+
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0d0e12',
-  },
-  inner: {
-    flex: 1,
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingBottom: Platform.OS === 'ios' ? 12 : 20,
-  },
-  scrollContent: {
-    paddingTop: 10,
-    paddingBottom: 20,
-  },
-  header: {
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  brandTitle: {
-    color: '#ffffff',
-    fontSize: 24,
-    fontWeight: '900',
-    letterSpacing: 3,
-    marginBottom: 4,
-  },
-  platformBadge: {
-    color: '#00e5ff',
-    fontSize: 12,
-    fontWeight: '700',
-    letterSpacing: 1,
-    marginBottom: 10,
-  },
-  badge: {
-    paddingHorizontal: 16,
-    paddingVertical: 7,
-    borderRadius: 20,
-  },
-  badgeLive: {
-    backgroundColor: 'rgba(0, 230, 118, 0.15)',
-    borderWidth: 1,
-    borderColor: '#00e676',
-  },
-  badgeOff: {
-    backgroundColor: '#1b1d24',
-  },
-  badgeText: {
-    color: '#8e92a4',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  hudCard: {
-    flexDirection: 'row',
-    backgroundColor: '#141721',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 12,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#23293a',
-    alignItems: 'center',
-    justifyContent: 'space-around',
-  },
-  hudCol: {
-    alignItems: 'center',
-  },
-  hudValue: {
-    color: '#ffffff',
-    fontSize: 22,
-    fontWeight: '900',
-    letterSpacing: 1,
-  },
-  hudLabel: {
-    color: '#656a80',
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.8,
-    marginTop: 2,
-  },
-  hudDivider: {
-    width: 1,
-    height: 30,
-    backgroundColor: '#23293a',
-  },
-  formBox: {
-    backgroundColor: '#141721',
-    padding: 20,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: '#23293a',
-  },
-  label: {
-    color: '#7b8098',
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 1.2,
-    marginBottom: 8,
-  },
-  input: {
-    backgroundColor: '#1c202e',
-    color: '#ffffff',
-    paddingHorizontal: 16,
-    paddingVertical: 13,
-    borderRadius: 12,
-    fontSize: 16,
-    fontWeight: '600',
-    borderWidth: 1,
-    borderColor: '#2d344a',
-  },
-  inputLocked: {
-    opacity: 0.45,
-    color: '#888888',
-  },
-  presetsRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 10,
-  },
-  presetBtn: {
-    flex: 1,
-    backgroundColor: '#1c202e',
-    paddingVertical: 8,
-    borderRadius: 8,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#2d344a',
-  },
-  presetBtnActive: {
-    borderColor: '#00e5ff',
-    backgroundColor: 'rgba(0, 229, 255, 0.1)',
-  },
-  presetText: {
-    color: '#c2c6dc',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  modeSection: {
-    marginTop: 18,
-    paddingTop: 16,
-    borderTopWidth: 1,
-    borderTopColor: '#23293a',
-  },
-  modeToggleRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  modeBtn: {
-    flex: 1,
-    backgroundColor: '#1c202e',
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#2d344a',
-  },
-  modeBtnActive: {
-    backgroundColor: 'rgba(0, 230, 118, 0.12)',
-    borderColor: '#00e676',
-  },
-  modeBtnText: {
-    color: '#8e92a4',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  modeBtnTextActive: {
-    color: '#00e676',
-  },
-  modeHint: {
-    color: '#555b72',
-    fontSize: 11,
-    marginTop: 8,
-    fontStyle: 'italic',
-  },
-  mainButton: {
-    height: 72,
-    borderRadius: 18,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginTop: 12,
-  },
-  btnStart: {
-    backgroundColor: '#00c853',
-    shadowColor: '#00c853',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 8,
-    elevation: 6,
-  },
-  btnStop: {
-    backgroundColor: '#ff1744',
-    shadowColor: '#ff1744',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 8,
-    elevation: 6,
-  },
-  mainButtonText: {
-    color: '#ffffff',
-    fontSize: 20,
-    fontWeight: '900',
-    letterSpacing: 2.5,
-  },
+const S = StyleSheet.create({
+  root:       { flex:1, backgroundColor:'#0d0e12' },
+  kav:        { flex:1, justifyContent:'space-between', paddingHorizontal:18, paddingBottom: Platform.OS==='ios'?12:20 },
+  scroll:     { paddingTop:12, paddingBottom:16 },
+  header:     { alignItems:'center', marginBottom:14 },
+  title:      { color:'#fff', fontSize:22, fontWeight:'900', letterSpacing:3 },
+  sub:        { color:'#00e5ff', fontSize:11, fontWeight:'700', letterSpacing:1, marginTop:2, marginBottom:8 },
+  badge:      { paddingHorizontal:16, paddingVertical:6, borderRadius:20 },
+  badgeOn:    { backgroundColor:'rgba(0,230,118,0.12)', borderWidth:1, borderColor:'#00e676' },
+  badgeOff:   { backgroundColor:'#1b1d24' },
+  badgeTxt:   { color:'#8e92a4', fontSize:12, fontWeight:'700' },
+  hud:        { flexDirection:'row', backgroundColor:'#141721', borderRadius:14, paddingVertical:14, paddingHorizontal:8, marginBottom:14, borderWidth:1, borderColor:'#23293a', alignItems:'center', justifyContent:'space-around' },
+  hudCol:     { alignItems:'center', flex:1 },
+  hudBig:     { color:'#fff', fontSize:20, fontWeight:'900' },
+  hudLbl:     { color:'#656a80', fontSize:9, fontWeight:'700', letterSpacing:0.8, marginTop:2 },
+  sep:        { width:1, height:28, backgroundColor:'#23293a' },
+  card:       { backgroundColor:'#141721', padding:18, borderRadius:16, borderWidth:1, borderColor:'#23293a' },
+  lbl:        { color:'#7b8098', fontSize:10, fontWeight:'800', letterSpacing:1.2, marginBottom:7 },
+  inp:        { backgroundColor:'#1c202e', color:'#fff', paddingHorizontal:14, paddingVertical:12, borderRadius:10, fontSize:15, fontWeight:'600', borderWidth:1, borderColor:'#2d344a' },
+  inpLocked:  { opacity:0.4 },
+  presets:    { flexDirection:'row', gap:7, marginTop:9 },
+  pre:        { flex:1, backgroundColor:'#1c202e', paddingVertical:8, borderRadius:8, alignItems:'center', borderWidth:1, borderColor:'#2d344a' },
+  preOn:      { borderColor:'#00e5ff', backgroundColor:'rgba(0,229,255,0.1)' },
+  preTxt:     { color:'#aaa', fontSize:11, fontWeight:'700' },
+  preTxtOn:   { color:'#00e5ff' },
+  modeBox:    { marginTop:16, paddingTop:14, borderTopWidth:1, borderTopColor:'#23293a' },
+  modeRow:    { flexDirection:'row', gap:9 },
+  modeBtn:    { flex:1, backgroundColor:'#1c202e', paddingVertical:11, borderRadius:9, alignItems:'center', borderWidth:1, borderColor:'#2d344a' },
+  modeBtnOn:  { backgroundColor:'rgba(0,230,118,0.1)', borderColor:'#00e676' },
+  modeTxt:    { color:'#8e92a4', fontSize:12, fontWeight:'700' },
+  modeTxtOn:  { color:'#00e676' },
+  modeHint:   { color:'#4a5068', fontSize:10, fontStyle:'italic', marginTop:7 },
+  btn:        { height:70, borderRadius:16, justifyContent:'center', alignItems:'center', marginTop:10 },
+  btnStart:   { backgroundColor:'#00c853', shadowColor:'#00c853', shadowOffset:{width:0,height:4}, shadowOpacity:0.4, shadowRadius:8, elevation:6 },
+  btnStop:    { backgroundColor:'#ff1744', shadowColor:'#ff1744', shadowOffset:{width:0,height:4}, shadowOpacity:0.4, shadowRadius:8, elevation:6 },
+  btnTxt:     { color:'#fff', fontSize:19, fontWeight:'900', letterSpacing:2 },
 });
