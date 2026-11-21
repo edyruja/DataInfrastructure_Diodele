@@ -135,73 +135,66 @@ function Index() {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
 
-  // Current session's live state & status detection (Near Real-Time Polling)
+  // Current session's live state & status detection (Real-time tracking)
+  const currentSessionObj = useMemo(() => {
+    return sessions.find((s) => s.session_id === sessionId);
+  }, [sessions, sessionId]);
+
   const liveSessionState = liveSessionsMap[sessionId];
-  const secondsSinceLastLive = liveSessionState
-    ? (Date.now() - liveSessionState.lastSeen) / 1000
+  const currentSessionLastUpdateMs = useMemo(() => {
+    if (liveSessionState) return liveSessionState.lastSeen;
+    const str = currentSessionObj?.updated_at || currentSessionObj?.created_at;
+    return str ? new Date(str).getTime() : 0;
+  }, [liveSessionState, currentSessionObj]);
+
+  const secondsSinceLastLive = currentSessionLastUpdateMs > 0
+    ? (Date.now() - currentSessionLastUpdateMs) / 1000
     : Infinity;
 
   const isCurrentSessionLive = secondsSinceLastLive < 10;
   const isCurrentSessionRecent = !isCurrentSessionLive && secondsSinceLastLive < 60;
   const liveTrackPoints = livePointsBySession[sessionId] ?? [];
 
-  // ── Ordered Sessions: ALL LIVE SESSIONS APPEAR FIRST ABOVE DATABASE SESSIONS ──
-  const orderedSessions = useMemo(() => {
-    const allMap = new Map<string, ApiSession>();
-
-    // 1. Add all sessions from the database
-    for (const s of sessions) {
-      allMap.set(s.session_id, s);
-    }
-
-    // 2. Add or update any live session from liveSessionsMap
-    for (const [id, liveData] of Object.entries(liveSessionsMap)) {
-      const existing = allMap.get(id);
-      if (existing) {
-        allMap.set(id, {
-          ...existing,
-          device_id: liveData.deviceId || existing.device_id,
-          track_name: liveData.trackName || existing.track_name,
-        });
-      } else {
-        allMap.set(id, {
-          session_id: id,
-          device_id: liveData.deviceId,
-          track_name: liveData.trackName,
-          created_at: new Date(liveData.lastSeen).toISOString(),
-        });
-      }
-    }
-
-    const all = Array.from(allMap.values());
+  // ── Ordered Sessions: LIVE sessions appear first, then RECENT, then RECORDED by updated_at ──
+  const { liveSessions, recentSessions, recordedSessions } = useMemo(() => {
     const liveList: ApiSession[] = [];
+    const recentList: ApiSession[] = [];
     const recordedList: ApiSession[] = [];
-
     const now = Date.now();
-    for (const s of all) {
+
+    for (const s of sessions) {
       const liveData = liveSessionsMap[s.session_id];
-      if (liveData && now - liveData.lastSeen < 15000) {
+      const lastUpdateStr = liveData
+        ? new Date(liveData.lastSeen).toISOString()
+        : s.updated_at || s.created_at;
+      const lastUpdateMs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0;
+      const secondsAgo = (now - lastUpdateMs) / 1000;
+
+      if (secondsAgo < 10) {
         liveList.push(s);
+      } else if (secondsAgo < 60) {
+        recentList.push(s);
       } else {
         recordedList.push(s);
       }
     }
 
-    // Sort live sessions: most recently active first
-    liveList.sort((a, b) => {
-      const tA = liveSessionsMap[a.session_id]?.lastSeen ?? 0;
-      const tB = liveSessionsMap[b.session_id]?.lastSeen ?? 0;
+    const sortByTime = (a: ApiSession, b: ApiSession) => {
+      const tA = new Date(a.updated_at || a.created_at).getTime();
+      const tB = new Date(b.updated_at || b.created_at).getTime();
       return tB - tA;
-    });
+    };
 
-    // Sort recorded sessions: newest created_at first
-    recordedList.sort((a, b) => {
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+    liveList.sort(sortByTime);
+    recentList.sort(sortByTime);
+    recordedList.sort(sortByTime);
 
-    // ALL live sessions appear first, followed by all database sessions!
-    return [...liveList, ...recordedList];
+    return { liveSessions: liveList, recentSessions: recentList, recordedSessions: recordedList };
   }, [sessions, liveSessionsMap]);
+
+  const orderedSessions = useMemo(() => {
+    return [...liveSessions, ...recentSessions, ...recordedSessions];
+  }, [liveSessions, recentSessions, recordedSessions]);
 
   // ── Load sessions from database ──────────────────────────────────────────
   const loadSessions = useCallback(async (selectFirst = false) => {
@@ -238,7 +231,15 @@ function Index() {
       if (!isMounted || !sessionId) return;
       try {
         const livePts = await fetchLiveTelemetry(sessionId, 3500);
-        if (!isMounted || !Array.isArray(livePts) || livePts.length === 0) return;
+        if (!isMounted || !Array.isArray(livePts) || livePts.length === 0) {
+          setLiveSessionsMap((prev) => {
+            if (!prev[sessionId]) return prev;
+            const next = { ...prev };
+            delete next[sessionId];
+            return next;
+          });
+          return;
+        }
 
         const now = Date.now();
         const newest = livePts[livePts.length - 1]!;
@@ -1062,17 +1063,22 @@ function Index() {
                 <SelectContent className="max-h-72">
                   {orderedSessions.map((s) => {
                     const liveData = liveSessionsMap[s.session_id];
-                    const isSessionLive = liveData && (Date.now() - liveData.lastSeen) < 10000;
-                    const isSessionRecent = liveData && !isSessionLive && (Date.now() - liveData.lastSeen) < 60000;
+                    const lastUpdateStr = liveData
+                      ? new Date(liveData.lastSeen).toISOString()
+                      : s.updated_at || s.created_at;
+                    const lastUpdateMs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0;
+                    const secAgo = (Date.now() - lastUpdateMs) / 1000;
+                    const isItemLive = secAgo < 10;
+                    const isItemRecent = !isItemLive && secAgo < 60;
                     return (
                       <SelectItem key={s.session_id} value={s.session_id}>
                         <div className="flex items-center gap-2 py-0.5">
-                          {isSessionLive ? (
+                          {isItemLive ? (
                             <span className="flex items-center gap-1 font-semibold text-green-400">
                               <span className="size-2 rounded-full bg-green-500 animate-pulse" />
                               LIVE
                             </span>
-                          ) : isSessionRecent ? (
+                          ) : isItemRecent ? (
                             <span className="flex items-center gap-1 font-semibold text-yellow-400">
                               <span className="size-2 rounded-full bg-yellow-500" />
                               RECENT
@@ -1121,14 +1127,14 @@ function Index() {
                 <span className="size-2 rounded-full bg-yellow-500" />
                 ● Recent
               </span>
-            ) : Object.keys(liveSessionsMap).length > 0 ? (
+            ) : liveSessions.length > 0 ? (
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  const firstLiveId = Object.keys(liveSessionsMap)[0];
-                  if (firstLiveId) {
-                    setSessionId(firstLiveId);
+                  const firstLive = liveSessions[0];
+                  if (firstLive) {
+                    setSessionId(firstLive.session_id);
                     setSelectedLapId(null);
                   }
                 }}

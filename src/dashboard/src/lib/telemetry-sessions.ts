@@ -22,6 +22,7 @@ export type ApiSession = {
   device_id: string;
   track_name: string;
   created_at: string;
+  updated_at?: string;
 };
 
 export type ApiLap = {

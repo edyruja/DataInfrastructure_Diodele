@@ -95,10 +95,11 @@ async function processBatchConsumer(data, env) {
 
   if (!ses) {
     // Creem sesiunea în D1 (prima oară)
+    const nowIso = new Date().toISOString();
     await env.DB.prepare(
-      "INSERT OR IGNORE INTO sessions (session_id, device_id, track_name, created_at) VALUES (?, ?, ?, ?)"
+      "INSERT OR IGNORE INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
     )
-      .bind(sessionId, deviceId, trackName, new Date().toISOString())
+      .bind(sessionId, deviceId, trackName, nowIso, nowIso)
       .run();
 
     ses = {
@@ -203,12 +204,16 @@ async function flushPointsToD1(ses, env) {
   const stmt = env.DB.prepare(
     "INSERT INTO telemetry_points (lap_id, lap_offset_ms, lat, lon, speed_kmh, bearing, g_lat, g_lon, is_corner_apex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
+  const updateSes = env.DB.prepare(
+    "UPDATE sessions SET updated_at = ? WHERE session_id = ?"
+  ).bind(new Date().toISOString(), ses.sessionId);
 
-  await env.DB.batch(
-    toInsert.map((p) =>
+  await env.DB.batch([
+    ...toInsert.map((p) =>
       stmt.bind(p.lap_id, p.lap_offset_ms, p.lat, p.lon, p.speed_kmh, p.bearing, p.g_lat, p.g_lon, p.is_corner_apex)
-    )
-  );
+    ),
+    updateSes,
+  ]);
 }
 
 async function saveCompletedLap(ses, endTs, env) {
@@ -274,7 +279,7 @@ export default {
 
     if (url.pathname === "/api/sessions" || url.pathname === "/sessions") {
       const { results } = await env.DB.prepare(
-        "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 50"
+        "SELECT session_id, device_id, track_name, created_at, COALESCE(updated_at, created_at) as updated_at FROM sessions ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50"
       ).all();
       return Response.json(results, { headers: corsHeaders });
     }
@@ -322,6 +327,29 @@ export default {
     if (liveMatch) {
       const sessionId = decodeURIComponent(liveMatch[2]);
       const lastMs = parseInt(url.searchParams.get("last_ms") || "2000", 10);
+
+      // Verificăm dacă sesiunea a avut activitate reală în ultimele 12 secunde
+      const { results: sesResults } = await env.DB.prepare(
+        "SELECT updated_at, created_at FROM sessions WHERE session_id = ?"
+      )
+        .bind(sessionId)
+        .all();
+
+      const ses = sesResults?.[0];
+      const lastUpdateStr = ses?.updated_at || ses?.created_at;
+      const lastUpdateMs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0;
+      const secondsAgo = (Date.now() - lastUpdateMs) / 1000;
+
+      // Dacă nu a trimis date în ultimele 12 secunde, sesiunea NU este live!
+      if (!lastUpdateMs || secondsAgo > 12) {
+        return Response.json([], {
+          headers: {
+            ...corsHeaders,
+            "X-Session-Status": "offline",
+            "X-Seconds-Ago": String(Math.round(secondsAgo)),
+          },
+        });
+      }
 
       // Luăm cel mai recent lap_offset_ms din sesiune
       const { results: latest } = await env.DB.prepare(
