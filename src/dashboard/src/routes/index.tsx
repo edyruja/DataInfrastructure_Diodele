@@ -102,6 +102,9 @@ function Index() {
   // ── G-G Diagram Zoom (index into G_ZOOM_LEVELS) ───────────────────────────
   const [gZoomIndex, setGZoomIndex] = useState<number>(0);
 
+  // ── Track Hover State (Speed & G-G sync on mouse hover) ───────────────────
+  const [hoveredPoint, setHoveredPoint] = useState<Projected | null>(null);
+
   // ── 60 FPS Replay Mode (Historical sessions from DB only) ──────────────────
   const [isPlaying, setIsPlaying] = useState(false);
   const [replaySpeed, setReplaySpeed] = useState<number>(1);
@@ -539,6 +542,38 @@ function Index() {
       ? fullProjectedTrack[fullProjectedTrack.length - 1]
       : null;
 
+  // Hover handler for circuit map SVG: locates nearest track point and syncs speed + G-force
+  const handleTrackMouseMove = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (fullProjectedTrack.length < 2) return;
+      const svg = e.currentTarget;
+      const rect = svg.getBoundingClientRect();
+      const svgX = ((e.clientX - rect.left) / rect.width) * 400;
+      const svgY = ((e.clientY - rect.top) / rect.height) * 220;
+
+      let closest: Projected | null = null;
+      let minDistanceSq = Infinity;
+
+      for (let i = 0; i < fullProjectedTrack.length; i++) {
+        const pt = fullProjectedTrack[i]!;
+        const dx = pt.x - svgX;
+        const dy = pt.y - svgY;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < minDistanceSq) {
+          minDistanceSq = d2;
+          closest = pt;
+        }
+      }
+
+      if (closest && Math.sqrt(minDistanceSq) <= 45) {
+        setHoveredPoint(closest);
+      } else {
+        setHoveredPoint(null);
+      }
+    },
+    [fullProjectedTrack],
+  );
+
   const mapMaxSpeed = useMemo(() => {
     const list = isCurrentSessionLive ? liveTrackPoints : displayedTelemetry;
     if (!list.length) return 1;
@@ -747,9 +782,20 @@ function Index() {
   const currentGZoom = G_ZOOM_LEVELS[gZoomIndex] ?? G_ZOOM_LEVELS[0];
   const scalePxPerG = 96 / currentGZoom.maxG;
 
+  // Effective G-forces: When user hovers on a track point, prioritize hovered G-forces!
+  const effectiveGLat = hoveredPoint
+    ? (hoveredPoint.g_lat ?? 0)
+    : currentGLat;
+
+  const effectiveGLon = hoveredPoint
+    ? (hoveredPoint.g_lon ?? 0)
+    : currentGLon;
+
+  const isGActive = Boolean(hoveredPoint) || isCurrentSessionLive || isReplaying;
+
   // SVG G-meter needle dot position
-  const rawGx = 110 + (isCurrentSessionLive || isReplaying ? currentGLat : 0) * scalePxPerG;
-  const rawGy = 110 - (isCurrentSessionLive || isReplaying ? currentGLon : 0) * scalePxPerG;
+  const rawGx = 110 + (isGActive ? effectiveGLat : 0) * scalePxPerG;
+  const rawGy = 110 - (isGActive ? effectiveGLon : 0) * scalePxPerG;
   const gx = Math.max(10, Math.min(210, rawGx));
   const gy = Math.max(10, Math.min(210, rawGy));
 
@@ -1191,7 +1237,12 @@ function Index() {
               </div>
             </div>
 
-            <svg viewBox="0 0 400 220" className="mt-4 w-full select-none">
+            <svg
+              viewBox="0 0 400 220"
+              className="mt-4 w-full select-none cursor-crosshair"
+              onMouseMove={handleTrackMouseMove}
+              onMouseLeave={() => setHoveredPoint(null)}
+            >
               {fullProjectedTrack.length > 1 ? (
                 <>
                   {/* Road Corridor Outer Border / Curbs (Circuit Outline / Overlay) */}
@@ -1260,6 +1311,56 @@ function Index() {
                     />
                   )}
 
+                  {/* Hover Point Indicator and Floating Speed Tooltip */}
+                  {hoveredPoint && (
+                    <g className="pointer-events-none transition-all duration-75">
+                      <circle
+                        cx={hoveredPoint.x}
+                        cy={hoveredPoint.y}
+                        r="11"
+                        fill="none"
+                        stroke="#ffffff"
+                        strokeWidth="2"
+                        opacity="0.85"
+                      />
+                      <circle
+                        cx={hoveredPoint.x}
+                        cy={hoveredPoint.y}
+                        r="4.5"
+                        fill="#ffffff"
+                        stroke="#09090b"
+                        strokeWidth="2"
+                      />
+                      <g
+                        transform={`translate(${Math.max(45, Math.min(355, hoveredPoint.x))}, ${
+                          hoveredPoint.y < 35 ? hoveredPoint.y + 26 : hoveredPoint.y - 14
+                        })`}
+                      >
+                        <rect
+                          x="-42"
+                          y="-18"
+                          width="84"
+                          height="22"
+                          rx="5"
+                          fill="#09090b"
+                          stroke="#ffffff"
+                          strokeWidth="1.5"
+                          filter="drop-shadow(0 2px 6px rgba(0,0,0,0.6))"
+                        />
+                        <text
+                          x="0"
+                          y="-3"
+                          textAnchor="middle"
+                          fill="#ffffff"
+                          fontSize="11"
+                          fontFamily="JetBrains Mono, monospace"
+                          fontWeight="700"
+                        >
+                          {hoveredPoint.speed.toFixed(1)} km/h
+                        </text>
+                      </g>
+                    </g>
+                  )}
 
                   {/* Car Dot (Replay mode or Live mode) */}
                   {carDot && (
@@ -1310,8 +1411,23 @@ function Index() {
 
             <div className="mt-3 flex justify-between font-mono text-xs text-muted-foreground">
               <span>
-                {isReplaying ? "Speed " : "Peak speed "}
-                <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
+                {hoveredPoint ? (
+                  <>
+                    Hover: <b className="text-white font-semibold">{hoveredPoint.speed.toFixed(1)} km/h</b>
+                    <span className="ml-2 text-[11px] text-muted-foreground">
+                      ({hoveredPoint.g_lat && hoveredPoint.g_lat >= 0 ? "+" : ""}{(hoveredPoint.g_lat ?? 0).toFixed(2)}G lat,{" "}
+                      {hoveredPoint.g_lon && hoveredPoint.g_lon >= 0 ? "+" : "−"}{Math.abs(hoveredPoint.g_lon ?? 0).toFixed(2)}G lon)
+                    </span>
+                  </>
+                ) : isReplaying ? (
+                  <>
+                    Speed <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
+                  </>
+                ) : (
+                  <>
+                    Peak speed <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
+                  </>
+                )}
               </span>
               <div className="flex items-center gap-3">
                 <span className="flex items-center gap-1 text-[11px]">
@@ -1413,8 +1529,37 @@ function Index() {
                   );
                 })}
 
-              {/* Indicator: Live mode has needle line, Replay mode has only the moving point without line, Exit/Static has center dot */}
-              {isCurrentSessionLive ? (
+              {/* Indicator: Hover mode has white vector line + pulse dot, Live mode has needle line, Replay mode has moving dot, Static has center dot */}
+              {hoveredPoint ? (
+                <g className="transition-all duration-75">
+                  <line
+                    x1="110"
+                    y1="110"
+                    x2={gx}
+                    y2={gy}
+                    stroke="#ffffff"
+                    strokeWidth="2.5"
+                    strokeDasharray="2 2"
+                  />
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="12"
+                    fill="none"
+                    stroke="#ffffff"
+                    strokeWidth="1.5"
+                    opacity="0.4"
+                  />
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="6.5"
+                    fill="#ffffff"
+                    stroke="#09090b"
+                    strokeWidth="2"
+                  />
+                </g>
+              ) : isCurrentSessionLive ? (
                 <>
                   <line
                     x1="110"
@@ -1467,18 +1612,19 @@ function Index() {
             <div className="mt-3 flex justify-between font-mono text-xs text-muted-foreground">
               <span>
                 Lateral{" "}
-                <b className="text-accent">
-                  {isCurrentSessionLive || isReplaying
-                    ? `${currentGLat >= 0 ? "+" : ""}${currentGLat.toFixed(2)} G`
-                    : `+${maxGLat.toFixed(2)} G max`}
+                <b className={hoveredPoint ? "text-white font-semibold" : "text-accent"}>
+                  {effectiveGLat >= 0 ? "+" : ""}{effectiveGLat.toFixed(2)} G
                 </b>
+                {hoveredPoint && (
+                  <span className="ml-1 text-[10px] text-white/80 font-medium">
+                    (hover)
+                  </span>
+                )}
               </span>
               <span>
                 Longitudinal{" "}
-                <b className="text-destructive">
-                  {isCurrentSessionLive || isReplaying
-                    ? `${currentGLon >= 0 ? "+" : "−"}${Math.abs(currentGLon).toFixed(2)} G`
-                    : `−${maxGBrake.toFixed(2)} G max brk`}
+                <b className={hoveredPoint ? "text-white font-semibold" : "text-destructive"}>
+                  {effectiveGLon >= 0 ? "+" : "−"}{Math.abs(effectiveGLon).toFixed(2)} G
                 </b>
               </span>
             </div>
