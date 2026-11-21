@@ -11,7 +11,8 @@ function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
   const avgAx = slice.reduce((s, p) => s + (p.ax || 0), 0) / len;
   const avgAy = slice.reduce((s, p) => s + (p.ay || 0), 0) / len;
   const avgAz = slice.reduce((s, p) => s + (p.az || 0), 0) / len;
-  const avgGz = slice.reduce((s, p) => s + Math.abs(p.gz || 0), 0) / len;
+  const avgGzSigned = slice.reduce((s, p) => s + (p.gz || 0), 0) / len;
+  const avgGz = Math.abs(avgGzSigned);
 
   const sensorMag = Math.sqrt(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
   const totalG = Number(sensorMag.toFixed(3));
@@ -29,13 +30,16 @@ function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
     if (kNorm > 0.08) {
       const ratioLat = aLatKinematic / kNorm;
       const ratioLon = aLonKinematic / kNorm;
-      const dynamicGLat = sensorMag * ratioLat;
+      // Semnul virajului: dacă mașina virează stânga sau dreapta, gLat trebuie să fie pozitiv sau negativ
+      const turnSign = avgGzSigned >= 0 ? 1 : -1;
+      const dynamicGLat = sensorMag * ratioLat * turnSign;
       const dynamicGLon = sensorMag * ratioLon * (accelGps >= 0 ? 1 : -1);
       gLat = Number(dynamicGLat.toFixed(3));
       gLon = Number(dynamicGLon.toFixed(3));
       gBrake = dynamicGLon < 0 ? Number(Math.abs(dynamicGLon).toFixed(3)) : 0;
     } else {
-      gLat = Number((Math.abs(avgAx) * 0.2).toFixed(3));
+      // Linie dreaptă sau accelerație laterală pură din senzorul fizic (+ dreapta, - stânga)
+      gLat = Number((avgAx * 0.2).toFixed(3));
       gLon = 0;
       gBrake = 0;
     }
