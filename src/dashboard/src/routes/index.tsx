@@ -554,31 +554,38 @@ function Index() {
   const isReplaying =
     !isCurrentSessionLive && replayTimeMs !== null && displayedTelemetry.length > 1;
 
-  // ── Exact Replay Frame: picks the EXACT recorded 20 Hz point without synthetic interpolation ──
+  // ── Exact Replay Point: calculated from smoothFullTrack (identical to the white hover point) ──
   const currentReplayPoint = useMemo(() => {
-    if (!isReplaying || replayTimeMs === null || displayedTelemetry.length === 0) return null;
+    if (!isReplaying || replayTimeMs === null) return null;
+    const trackSource = smoothFullTrack.length > 0 ? smoothFullTrack : fullProjectedTrack;
+    if (trackSource.length === 0) return null;
+
     const targetMs = baseTimeMs + replayTimeMs;
 
-    // Binary search: găsim exact punctul din baza de date corespunzător milisecundei curente
     let low = 0;
-    let high = displayedTelemetry.length - 1;
+    let high = trackSource.length - 1;
     while (low <= high) {
       const mid = (low + high) >> 1;
-      if (displayedTelemetry[mid]!.lap_offset_ms <= targetMs) {
+      const ptTime = trackSource[mid]!.timeMs ?? 0;
+      if (ptTime <= targetMs) {
         low = mid + 1;
       } else {
         high = mid - 1;
       }
     }
-    const idx = Math.max(0, Math.min(displayedTelemetry.length - 1, high));
-    const pt = displayedTelemetry[idx]!;
+    const idx = Math.max(0, Math.min(trackSource.length - 1, high));
+    const pt = trackSource[idx]!;
+    const g_lat = pt.g_lat ?? 0;
+    const g_lon = pt.g_lon ?? 0;
     return {
       ...pt,
       index: idx,
-      timeMs: pt.lap_offset_ms,
-      total_g: Number(Math.hypot(pt.g_lat, pt.g_lon).toFixed(2)),
+      speed_kmh: pt.speed,
+      g_lat,
+      g_lon,
+      total_g: Number(Math.hypot(g_lat, g_lon).toFixed(2)),
     };
-  }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
+  }, [isReplaying, replayTimeMs, smoothFullTrack, fullProjectedTrack, baseTimeMs]);
 
   const currentReplayFrame = currentReplayPoint;
 
@@ -735,20 +742,12 @@ function Index() {
   // In Replay Mode: car moves continuously at 60 FPS along the circuit track without pausing or jumping.
   // In Live Mode: smoothly glides using 60 FPS interpolated buffered chunk coordinates.
   const carDot = useMemo(() => {
-    // 1. Replay Mode: ia coordonatele și viteza EXACTĂ direct din punctul citit din baza de date
-    if (isReplaying && currentReplayPoint && trackBounds) {
-      const pos = projectCoordWithBounds(
-        currentReplayPoint.lat,
-        currentReplayPoint.lon,
-        trackBounds,
-        400,
-        220,
-        24,
-      );
+    // 1. Replay Mode: poziția pe circuit este calculată identic cu punctul alb (pe linia de traseu)
+    if (isReplaying && currentReplayPoint) {
       return {
-        x: pos.x,
-        y: pos.y,
-        speed: currentReplayPoint.speed_kmh,
+        x: currentReplayPoint.x,
+        y: currentReplayPoint.y,
+        speed: currentReplayPoint.speed,
         isSnapped: false,
       };
     }
@@ -1770,20 +1769,29 @@ function Index() {
                   />
                 </>
               ) : isReplaying ? (
-                <g>
-                  <circle
-                    cx={gx}
-                    cy={gy}
-                    r="10"
-                    fill="none"
+                <g className="transition-all duration-75">
+                  <line
+                    x1="110"
+                    y1="110"
+                    x2={gx}
+                    y2={gy}
                     stroke="var(--accent)"
-                    strokeWidth="1.5"
-                    opacity="0.3"
+                    strokeWidth="2.5"
+                    strokeDasharray="2 2"
                   />
                   <circle
                     cx={gx}
                     cy={gy}
-                    r="6"
+                    r="12"
+                    fill="none"
+                    stroke="var(--accent)"
+                    strokeWidth="1.5"
+                    opacity="0.4"
+                  />
+                  <circle
+                    cx={gx}
+                    cy={gy}
+                    r="6.5"
                     fill="var(--accent)"
                     stroke="#09090b"
                     strokeWidth="2"
