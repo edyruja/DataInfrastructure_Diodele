@@ -316,6 +316,48 @@ export default {
       return Response.json(results, { headers: corsHeaders });
     }
 
+    // ── LIVE POLLING: ultimele N milisecunde de telemetrie pentru animație fluidă ──
+    // GET /api/sessions/:id/live?last_ms=2000
+    const liveMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/live$/);
+    if (liveMatch) {
+      const sessionId = decodeURIComponent(liveMatch[2]);
+      const lastMs = parseInt(url.searchParams.get("last_ms") || "2000", 10);
+
+      // Luăm cel mai recent lap_offset_ms din sesiune
+      const { results: latest } = await env.DB.prepare(
+        `SELECT tp.lap_offset_ms
+         FROM telemetry_points tp
+         LEFT JOIN laps l ON tp.lap_id = l.lap_id
+         WHERE l.session_id = ? OR tp.lap_id LIKE ?
+         ORDER BY tp.id DESC
+         LIMIT 1`
+      )
+        .bind(sessionId, `${sessionId}%`)
+        .all();
+
+      if (!latest || latest.length === 0) {
+        return Response.json([], { headers: corsHeaders });
+      }
+
+      const maxOffset = latest[0].lap_offset_ms;
+      const minOffset = Math.max(0, maxOffset - lastMs);
+
+      // Returnăm toate punctele din fereastra de timp cerută
+      const { results } = await env.DB.prepare(
+        `SELECT tp.*, COALESCE(l.lap_number, 1) as lap_number
+         FROM telemetry_points tp
+         LEFT JOIN laps l ON tp.lap_id = l.lap_id
+         WHERE (l.session_id = ? OR tp.lap_id LIKE ?)
+           AND tp.lap_offset_ms >= ?
+           AND tp.lap_offset_ms <= ?
+         ORDER BY tp.lap_offset_ms ASC`
+      )
+        .bind(sessionId, `${sessionId}%`, minOffset, maxOffset)
+        .all();
+
+      return Response.json(results, { headers: corsHeaders });
+    }
+
     return new Response("F1 Telemetry API Online — Queue Architecture", { headers: corsHeaders });
   },
 
