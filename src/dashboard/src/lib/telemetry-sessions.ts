@@ -1,68 +1,150 @@
-export type Lap = readonly [string, string, string, string, string, string];
-export type Session = {
-  id: string;
-  label: string;
-  condition: string;
-  averageSpeed: number;
-  traction: number;
-  lateral: number;
-  longitudinal: number;
-  laps: readonly Lap[];
+// API + WebSocket client for DataInfrastructure_Diodele telemetry backend
+
+export const API_BASE_URL =
+  "https://datainfrastructure-diodele.cristianstefanpopa05.workers.dev";
+export const WS_LIVE_URL =
+  "wss://datainfrastructure-diodele.cristianstefanpopa05.workers.dev/ws?role=web";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ApiSession = {
+  session_id: string;
+  device_id: string;
+  track_name: string;
+  created_at: string;
 };
 
-export const sessions: readonly Session[] = [
-  {
-    id: "01", label: "Session #01 · Dry", condition: "GT3 Dry",
-    averageSpeed: 124.7, traction: 91.4, lateral: 1.12, longitudinal: -0.85,
-    laps: [
-      ["L1 (Out)", "1:18.410", "—", "168.2", "1.02", "−1.10"],
-      ["L2", "1:05.560", "+1.240s", "194.1", "1.28", "−1.42"],
-      ["L3", "1:04.320", "BEST", "198.4", "1.34", "−1.48"],
-      ["L4", "1:04.732", "+0.412s", "197.8", "1.31", "−1.45"],
-      ["L5", "1:05.105", "+0.785s", "196.2", "1.29", "−1.40"],
-      ["L6 (YF)", "1:09.840", "+5.520s", "174.5", "1.18", "−1.20"],
-      ["L7", "1:05.104", "+0.784s", "197.1", "1.33", "−1.46"],
-    ],
-  },
-  {
-    id: "02", label: "Session #02 · Wet", condition: "GT3 Wet",
-    averageSpeed: 106.3, traction: 78.6, lateral: 0.84, longitudinal: -0.62,
-    laps: [
-      ["L1 (Out)", "1:29.810", "—", "145.2", "0.78", "−0.82"],
-      ["L2", "1:16.420", "+1.530s", "173.2", "0.98", "−1.05"],
-      ["L3", "1:15.260", "+0.370s", "176.5", "1.02", "−1.10"],
-      ["L4", "1:14.890", "BEST", "178.6", "1.06", "−1.14"],
-      ["L5", "1:15.680", "+0.790s", "175.4", "1.01", "−1.08"],
-    ],
-  },
-  {
-    id: "03", label: "Session #03 · Dry", condition: "GT3 Dry",
-    averageSpeed: 128.2, traction: 94.2, lateral: 1.24, longitudinal: -0.96,
-    laps: [
-      ["L1 (Out)", "1:17.200", "—", "171.4", "1.08", "−1.16"],
-      ["L2", "1:04.120", "+0.640s", "199.6", "1.36", "−1.50"],
-      ["L3", "1:03.820", "+0.340s", "201.2", "1.39", "−1.53"],
-      ["L4", "1:03.480", "BEST", "202.1", "1.42", "−1.56"],
-      ["L5 (YF)", "1:10.120", "+6.640s", "176.3", "1.20", "−1.24"],
-      ["L6", "1:03.960", "+0.480s", "200.4", "1.38", "−1.51"],
-    ],
-  },
-];
+export type ApiLap = {
+  lap_id: string;
+  lap_number: number;
+  duration_ms: number;
+  max_speed_kmh: number;
+  avg_speed_kmh: number;
+  max_g_lat: number;
+  max_g_brake: number;
+};
 
-export function selectSession(id: string): Session {
-  const session = sessions.find((item) => item.id === id) ?? sessions[0];
-  if (!session) throw new Error("No telemetry sessions available");
-  return session;
+export type TelemetryPoint = {
+  lap_id: string;
+  lap_number: number;
+  lap_offset_ms: number;
+  lat: number;
+  lon: number;
+  speed_kmh: number;
+  bearing: number;
+  g_lat: number;
+  g_lon: number;
+  is_corner_apex: 0 | 1;
+};
+
+export type LiveFrame = {
+  type: "LIVE_FRAME";
+  status: "STREAMING";
+  session_id: string;
+  device_id: string;
+  track_name: string;
+  current_lap: number;
+  current_lap_time_ms: number;
+  frame: {
+    lat: number;
+    lon: number;
+    speed_kmh: number;
+    g_lat: number;
+    g_lon: number;
+    total_g: number;
+    is_corner_apex: 0 | 1;
+  };
+};
+
+export type SessionEndedMsg = { type: "SESSION_ENDED"; session_id: string };
+
+export type WsMessage = LiveFrame | SessionEndedMsg;
+
+// ---------------------------------------------------------------------------
+// API fetch helpers
+// ---------------------------------------------------------------------------
+
+export async function fetchSessions(
+  signal?: AbortSignal,
+): Promise<ApiSession[]> {
+  const res = await fetch(`${API_BASE_URL}/sessions`, {
+    signal: signal ?? null,
+  });
+  if (!res.ok) throw new Error(`fetchSessions: HTTP ${res.status}`);
+  return res.json() as Promise<ApiSession[]>;
 }
 
-export function visibleLaps(session: Session, validOnly: boolean) {
-  return validOnly ? session.laps.filter((lap) => !lap[0].includes("(")) : session.laps;
+export async function fetchLaps(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ApiLap[]> {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/laps`, {
+    signal: signal ?? null,
+  });
+  if (!res.ok) throw new Error(`fetchLaps: HTTP ${res.status}`);
+  return res.json() as Promise<ApiLap[]>;
 }
 
-export function sessionMetrics(session: Session) {
-  const best = session.laps.find((lap) => lap[2] === "BEST");
-  const maxSpeed = Math.max(...session.laps.map((lap) => Number(lap[3])));
-  const maxLateral = Math.max(...session.laps.map((lap) => Number(lap[4])));
-  const maxBraking = Math.min(...session.laps.map((lap) => Number(lap[5].replace("−", "-"))));
-  return { bestTime: best?.[1] ?? "—", bestLap: best?.[0] ?? "—", maxSpeed, maxLateral, maxBraking };
+export async function fetchTelemetry(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<TelemetryPoint[]> {
+  const res = await fetch(`${API_BASE_URL}/sessions/${sessionId}/telemetry`, {
+    signal: signal ?? null,
+  });
+  if (!res.ok) throw new Error(`fetchTelemetry: HTTP ${res.status}`);
+  return res.json() as Promise<TelemetryPoint[]>;
+}
+
+export async function fetchLapTelemetry(
+  lapId: string,
+  signal?: AbortSignal,
+): Promise<TelemetryPoint[]> {
+  const res = await fetch(`${API_BASE_URL}/laps/${lapId}/telemetry`, {
+    signal: signal ?? null,
+  });
+  if (!res.ok) throw new Error(`fetchLapTelemetry: HTTP ${res.status}`);
+  return res.json() as Promise<TelemetryPoint[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/** Format duration_ms as "M:SS.mmm"  e.g. 64320 → "1:04.320" */
+export function formatLapTime(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  const millis = ms % 1000;
+  return `${minutes}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+/** Format delta vs best in ms e.g. +1240 → "+1.240s" */
+export function formatDelta(ms: number): string {
+  const sign = ms >= 0 ? "+" : "−";
+  const abs = Math.abs(ms);
+  const secs = Math.floor(abs / 1000);
+  const millis = abs % 1000;
+  return `${sign}${secs}.${String(millis).padStart(3, "0")}s`;
+}
+
+/** Map speed to a colour: green (fast) → yellow → red (slow/braking) */
+export function speedColor(speed: number, maxSpeed: number): string {
+  if (maxSpeed === 0) return "#22c55e";
+  const t = Math.max(0, Math.min(1, speed / maxSpeed));
+  // t=1 → green, t=0 → red, via yellow at t=0.5
+  if (t >= 0.5) {
+    // green ↔ yellow
+    const f = (t - 0.5) * 2;
+    const r = Math.round(255 * (1 - f));
+    return `rgb(${r},205,0)`;
+  } else {
+    // yellow ↔ red
+    const f = t * 2;
+    const g = Math.round(205 * f);
+    return `rgb(220,${g},0)`;
+  }
 }

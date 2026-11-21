@@ -1,19 +1,34 @@
 import { describe, expect, it } from "vitest";
-import { selectSession, sessionMetrics, visibleLaps } from "@/lib/telemetry-sessions";
+import { formatLapTime, formatDelta, speedColor } from "@/lib/telemetry-sessions";
 
-describe("Session selection", () => {
-  it("uses the selected session for metrics and laps", () => {
-    const dry = selectSession("01");
-    const wet = selectSession("02");
-    expect(sessionMetrics(dry).bestTime).toBe("1:04.320");
-    expect(sessionMetrics(wet)).toEqual({ bestTime: "1:14.890", bestLap: "L4", maxSpeed: 178.6, maxLateral: 1.06, maxBraking: -1.14 });
-    expect(visibleLaps(wet, false)).toHaveLength(5);
-    expect(visibleLaps(wet, false)[3]?.[1]).toBe("1:14.890");
+describe("formatLapTime", () => {
+  it("formats milliseconds as M:SS.mmm", () => {
+    expect(formatLapTime(64320)).toBe("1:04.320");
+    expect(formatLapTime(74890)).toBe("1:14.890");
+    expect(formatLapTime(78410)).toBe("1:18.410");
+    expect(formatLapTime(0)).toBe("0:00.000");
   });
+});
 
-  it("applies the valid-only filter to each selected session", () => {
-    expect(visibleLaps(selectSession("01"), true)).toHaveLength(5);
-    expect(visibleLaps(selectSession("02"), true)).toHaveLength(4);
-    expect(visibleLaps(selectSession("03"), true).map((lap) => lap[0])).toEqual(["L2", "L3", "L4", "L6"]);
+describe("formatDelta", () => {
+  it("formats positive delta with + sign", () => {
+    expect(formatDelta(1240)).toBe("+1.240s");
+    expect(formatDelta(530)).toBe("+0.530s");
+  });
+  it("formats zero delta", () => {
+    expect(formatDelta(0)).toBe("+0.000s");
+  });
+  it("formats negative delta with − sign", () => {
+    expect(formatDelta(-500)).toBe("−0.500s");
+  });
+});
+
+describe("speedColor", () => {
+  it("returns a colour string", () => {
+    const c = speedColor(100, 200);
+    expect(c).toMatch(/^(rgb|#)/);
+  });
+  it("handles zero maxSpeed without throwing", () => {
+    expect(() => speedColor(0, 0)).not.toThrow();
   });
 });
