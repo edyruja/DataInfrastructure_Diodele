@@ -798,6 +798,7 @@ function Index() {
     };
   }, [
     isReplaying,
+    currentReplayPoint,
     replayTrackPos,
     fullProjectedTrack,
     isCurrentSessionLive,
