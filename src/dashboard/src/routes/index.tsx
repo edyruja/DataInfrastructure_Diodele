@@ -554,24 +554,33 @@ function Index() {
   const isReplaying =
     !isCurrentSessionLive && replayTimeMs !== null && displayedTelemetry.length > 1;
 
-  // Interpolated 60 FPS state for replay (map & speed trace)
-  const currentReplayFrame = useMemo(() => {
-    if (!isReplaying || replayTimeMs === null) return null;
-    return interpolateTelemetryPoint(displayedTelemetry, baseTimeMs + replayTimeMs);
-  }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
-
-  // Exact recorded 20 Hz telemetry point for G-G diagram (takes direct values without synthetic blending)
+  // ── Exact Replay Frame: picks the EXACT recorded 20 Hz point without synthetic interpolation ──
   const currentReplayPoint = useMemo(() => {
     if (!isReplaying || replayTimeMs === null || displayedTelemetry.length === 0) return null;
-    if (currentReplayFrame) {
-      const idx =
-        currentReplayFrame.alpha >= 0.5
-          ? Math.min(displayedTelemetry.length - 1, currentReplayFrame.index + 1)
-          : currentReplayFrame.index;
-      return displayedTelemetry[idx] || null;
+    const targetMs = baseTimeMs + replayTimeMs;
+
+    // Binary search: găsim exact punctul din baza de date corespunzător milisecundei curente
+    let low = 0;
+    let high = displayedTelemetry.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (displayedTelemetry[mid]!.lap_offset_ms <= targetMs) {
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
     }
-    return null;
-  }, [isReplaying, replayTimeMs, displayedTelemetry, currentReplayFrame]);
+    const idx = Math.max(0, Math.min(displayedTelemetry.length - 1, high));
+    const pt = displayedTelemetry[idx]!;
+    return {
+      ...pt,
+      index: idx,
+      timeMs: pt.lap_offset_ms,
+      total_g: Number(Math.hypot(pt.g_lat, pt.g_lon).toFixed(2)),
+    };
+  }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
+
+  const currentReplayFrame = currentReplayPoint;
 
   // ── Reference Track: the established circuit path ────────────────────────
   // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
@@ -726,11 +735,11 @@ function Index() {
   // In Replay Mode: car moves continuously at 60 FPS along the circuit track without pausing or jumping.
   // In Live Mode: smoothly glides using 60 FPS interpolated buffered chunk coordinates.
   const carDot = useMemo(() => {
-    // 1. Replay Mode:
-    if (isReplaying && replayTrackPos && trackBounds) {
+    // 1. Replay Mode: ia coordonatele și viteza EXACTĂ direct din punctul citit din baza de date
+    if (isReplaying && currentReplayPoint && trackBounds) {
       const pos = projectCoordWithBounds(
-        replayTrackPos.lat,
-        replayTrackPos.lon,
+        currentReplayPoint.lat,
+        currentReplayPoint.lon,
         trackBounds,
         400,
         220,
@@ -739,7 +748,7 @@ function Index() {
       return {
         x: pos.x,
         y: pos.y,
-        speed: replayTrackPos.speed_kmh,
+        speed: currentReplayPoint.speed_kmh,
         isSnapped: false,
       };
     }
