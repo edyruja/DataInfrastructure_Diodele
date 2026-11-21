@@ -554,11 +554,24 @@ function Index() {
   const isReplaying =
     !isCurrentSessionLive && replayTimeMs !== null && displayedTelemetry.length > 1;
 
-  // Interpolated 60 FPS state for replay
+  // Interpolated 60 FPS state for replay (map & speed trace)
   const currentReplayFrame = useMemo(() => {
     if (!isReplaying || replayTimeMs === null) return null;
     return interpolateTelemetryPoint(displayedTelemetry, baseTimeMs + replayTimeMs);
   }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
+
+  // Exact recorded 20 Hz telemetry point for G-G diagram (takes direct values without synthetic blending)
+  const currentReplayPoint = useMemo(() => {
+    if (!isReplaying || replayTimeMs === null || displayedTelemetry.length === 0) return null;
+    if (currentReplayFrame) {
+      const idx =
+        currentReplayFrame.alpha >= 0.5
+          ? Math.min(displayedTelemetry.length - 1, currentReplayFrame.index + 1)
+          : currentReplayFrame.index;
+      return displayedTelemetry[idx] || null;
+    }
+    return null;
+  }, [isReplaying, replayTimeMs, displayedTelemetry, currentReplayFrame]);
 
   // ── Reference Track: the established circuit path ────────────────────────
   // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
@@ -909,21 +922,27 @@ function Index() {
 
   const currentGLat = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0)
-    : isReplaying && currentReplayFrame
-      ? currentReplayFrame.g_lat
-      : maxGLat;
+    : isReplaying && currentReplayPoint
+      ? currentReplayPoint.g_lat
+      : isReplaying && currentReplayFrame
+        ? currentReplayFrame.g_lat
+        : maxGLat;
 
   const currentGLon = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0)
-    : isReplaying && currentReplayFrame
-      ? currentReplayFrame.g_lon
-      : -maxGBrake;
+    : isReplaying && currentReplayPoint
+      ? currentReplayPoint.g_lon
+      : isReplaying && currentReplayFrame
+        ? currentReplayFrame.g_lon
+        : -maxGBrake;
 
   const totalG = isCurrentSessionLive
     ? (liveInterpolatedFrame?.total_g ?? liveSessionState?.totalG ?? 0)
-    : isReplaying && currentReplayFrame
-      ? currentReplayFrame.total_g
-      : 0;
+    : isReplaying && currentReplayPoint
+      ? Number(Math.hypot(currentReplayPoint.g_lat, currentReplayPoint.g_lon).toFixed(2))
+      : isReplaying && currentReplayFrame
+        ? currentReplayFrame.total_g
+        : 0;
 
   // Active zoom level on G-G Diagram
   const currentGZoom = G_ZOOM_LEVELS[gZoomIndex] ?? G_ZOOM_LEVELS[0];
@@ -1330,12 +1349,12 @@ function Index() {
                 </span>
               </div>
 
-              {/* Speed Multiplier (1x, 2x, 4x) & 60 FPS indicator */}
+              {/* Speed Multiplier (1x, 2x, 3x) & Telemetry Hz indicator */}
               <div className="flex items-center gap-1.5">
                 <span className="font-mono text-[10px] text-muted-foreground uppercase tracking-wider hidden sm:inline mr-1">
                   Speed:
                 </span>
-                {[1, 2, 4].map((spd) => (
+                {[1, 2, 3].map((spd) => (
                   <Button
                     key={spd}
                     size="sm"
@@ -1346,8 +1365,8 @@ function Index() {
                     {spd}x
                   </Button>
                 ))}
-                <span className="ml-2 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 font-mono text-[10px] text-accent font-medium">
-                  60 FPS
+                <span className="ml-2 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-0.5 font-mono text-[10px] text-accent font-medium">
+                  {replaySpeed * 20} Hz
                 </span>
               </div>
             </div>

@@ -38,10 +38,18 @@ function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
       gLon = Number(dynamicGLon.toFixed(3));
       gBrake = dynamicGLon < 0 ? Number(Math.abs(dynamicGLon).toFixed(3)) : 0;
     } else {
-      // Linie dreaptă sau accelerație laterală pură din senzorul fizic (+ dreapta, - stânga)
-      gLat = Number((avgAx * 0.2).toFixed(3));
-      gLon = 0;
-      gBrake = 0;
+      // Linie dreaptă sau accelerație laterală pură din senzorul fizic
+      if (avgGz < 0.08) {
+        // Mașina merge drept (nu virează): forța laterală este 0, forța e exclusiv longitudinală!
+        gLat = 0;
+        const lonSign = (accelGps < 0 || avgAy < 0) ? -1 : 1;
+        gLon = Number((sensorMag * lonSign).toFixed(3));
+        gBrake = gLon < 0 ? Number(Math.abs(gLon).toFixed(3)) : 0;
+      } else {
+        gLat = Number((avgAx * 0.2).toFixed(3));
+        gLon = 0;
+        gBrake = 0;
+      }
     }
   }
 
