@@ -18,27 +18,28 @@ resource "cloudflare_d1_database" "telemetry_db" {
   name       = var.d1_database_name
 }
 
-# 2. Worker-ul Cloudflare de Backend (Telemetrie F1)
+# 2. Worker-ul Cloudflare de Backend (Telemetrie F1: datainfrastructure-diodele)
 # Încarcă index.js unificat din src/backend/src/index.js (self-contained)
 resource "cloudflare_workers_script" "telemetry_worker" {
   account_id = var.cloudflare_account_id
-  name       = var.worker_name
+  name       = var.backend_worker_name
   content    = file("${path.module}/../src/backend/src/index.js")
   module     = true
 
   compatibility_date  = "2026-01-01"
   compatibility_flags = ["nodejs_compat"]
 
+  # Leagă automat baza D1 de variabila "DB" din Worker
   d1_database_binding {
     name        = "DB"
     database_id = cloudflare_d1_database.telemetry_db.id
   }
 }
 
-# 3. Proiectul Cloudflare Pages pentru Dashboard (Interfața Web TanStack Start / Vite)
+# 3. Proiectul Cloudflare Pages / Worker pentru Dashboard (cu 12: datainfrastructure-diodele12)
 resource "cloudflare_pages_project" "dashboard_pages" {
   account_id        = var.cloudflare_account_id
-  name              = var.dashboard_name
+  name              = var.dashboard_worker_name
   production_branch = "main"
 
   build_config {

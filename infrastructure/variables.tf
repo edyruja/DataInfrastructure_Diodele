@@ -1,7 +1,7 @@
 variable "cloudflare_account_id" {
-  description = "ID-ul contului Cloudflare (Account ID)"
+  description = "ID-ul contului Cloudflare (Account ID din dashboard)"
   type        = string
-  default     = ""
+  default     = "dfe48fe11d5dfc0dc30a84dab037aff9"
 }
 
 variable "cloudflare_api_token" {
@@ -17,14 +17,14 @@ variable "d1_database_name" {
   default     = "pero_diodele"
 }
 
-variable "worker_name" {
-  description = "Numele worker-ului Cloudflare de telemetrie"
+variable "backend_worker_name" {
+  description = "Numele worker-ului Cloudflare de backend (Telemetrie F1)"
   type        = string
-  default     = "telemetry-worker"
+  default     = "datainfrastructure-diodele"
 }
 
-variable "dashboard_name" {
-  description = "Numele proiectului Cloudflare pentru dashboard"
+variable "dashboard_worker_name" {
+  description = "Numele worker-ului / proiectului Cloudflare pentru Dashboard (cu 12)"
   type        = string
-  default     = "diodele-dashboard"
+  default     = "datainfrastructure-diodele12"
 }

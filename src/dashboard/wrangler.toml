@@ -1,4 +1,4 @@
-name = "diodele-dashboard"
+name = "datainfrastructure-diodele12"
 main = ".output/server/index.mjs"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
