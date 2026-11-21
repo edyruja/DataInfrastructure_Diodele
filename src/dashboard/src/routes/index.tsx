@@ -72,6 +72,11 @@ const G_ZOOM_LEVELS = [
   { maxG: 0.6, circles: ["0.2", "0.4", "0.6"] },
 ] as const;
 
+type ActiveLiveSession = {
+  frame: LiveFrame;
+  lastSeen: number;
+};
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -84,12 +89,13 @@ function Index() {
 
   const [laps, setLaps] = useState<ApiLap[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
-  const [liveTrackPoints, setLiveTrackPoints] = useState<TelemetryPoint[]>([]);
   const [selectedLapId, setSelectedLapId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [liveFrame, setLiveFrame] = useState<LiveFrame | null>(null);
-  const [isLive, setIsLive] = useState(false);
+  // Multi-device active live sessions state (session_id -> ActiveLiveSession)
+  const [liveSessionsMap, setLiveSessionsMap] = useState<Record<string, ActiveLiveSession>>({});
+  const [livePointsBySession, setLivePointsBySession] = useState<Record<string, TelemetryPoint[]>>({});
+
   const [validOnly, setValidOnly] = useState(false);
 
   // ── G-G Diagram Zoom (index into G_ZOOM_LEVELS) ───────────────────────────
@@ -105,6 +111,92 @@ function Index() {
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastLapRef = useRef<number>(1);
+  const sessionIdRef = useRef<string>(sessionId);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  // Current session's live data
+  const liveFrame = liveSessionsMap[sessionId]?.frame ?? null;
+  const isCurrentSessionLive = !!liveFrame;
+  const liveTrackPoints = livePointsBySession[sessionId] ?? [];
+
+  // Periodic heartbeat: prune live sessions that haven't sent data in > 15s
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      setLiveSessionsMap((prev) => {
+        let changed = false;
+        const next: Record<string, ActiveLiveSession> = {};
+        for (const [id, data] of Object.entries(prev)) {
+          if (now - data.lastSeen < 15000) {
+            next[id] = data;
+          } else {
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 4000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // ── Ordered Sessions: ALL LIVE SESSIONS APPEAR FIRST ABOVE DATABASE SESSIONS ──
+  const orderedSessions = useMemo(() => {
+    const allMap = new Map<string, ApiSession>();
+
+    // 1. Add all sessions from the database
+    for (const s of sessions) {
+      allMap.set(s.session_id, s);
+    }
+
+    // 2. Add or update any live session from liveSessionsMap
+    for (const [id, liveData] of Object.entries(liveSessionsMap)) {
+      const existing = allMap.get(id);
+      if (existing) {
+        allMap.set(id, {
+          ...existing,
+          device_id: liveData.frame.device_id || existing.device_id,
+          track_name: liveData.frame.track_name || existing.track_name,
+        });
+      } else {
+        allMap.set(id, {
+          session_id: id,
+          device_id: liveData.frame.device_id,
+          track_name: liveData.frame.track_name,
+          created_at: new Date(liveData.lastSeen).toISOString(),
+        });
+      }
+    }
+
+    const all = Array.from(allMap.values());
+    const liveList: ApiSession[] = [];
+    const recordedList: ApiSession[] = [];
+
+    for (const s of all) {
+      if (liveSessionsMap[s.session_id]) {
+        liveList.push(s);
+      } else {
+        recordedList.push(s);
+      }
+    }
+
+    // Sort live sessions: most recently active first
+    liveList.sort((a, b) => {
+      const tA = liveSessionsMap[a.session_id]?.lastSeen ?? 0;
+      const tB = liveSessionsMap[b.session_id]?.lastSeen ?? 0;
+      return tB - tA;
+    });
+
+    // Sort recorded sessions: newest created_at first
+    recordedList.sort((a, b) => {
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+
+    // ALL live sessions appear first, followed by all database sessions!
+    return [...liveList, ...recordedList];
+  }, [sessions, liveSessionsMap]);
 
   // ── Load sessions from database ──────────────────────────────────────────
   const loadSessions = useCallback(async (selectFirst = false) => {
@@ -116,6 +208,8 @@ function Index() {
       const first = data[0];
       if (first) {
         setSessionId((prev) => {
+          // If already viewing an active live session, stay on it
+          if (prev && liveSessionsMap[prev]) return prev;
           if (!prev || selectFirst || !data.some((s) => s.session_id === prev)) {
             return first.session_id;
           }
@@ -128,7 +222,7 @@ function Index() {
     } finally {
       setSessionsLoading(false);
     }
-  }, []);
+  }, [liveSessionsMap]);
 
   // ── WebSocket setup ──────────────────────────────────────────────────────
   const connectWs = useCallback(() => {
@@ -142,18 +236,22 @@ function Index() {
       try {
         const msg = JSON.parse(ev.data as string) as WsMessage;
         if (msg.type === "LIVE_FRAME") {
-          setLiveFrame(msg);
-          setIsLive(true);
+          const now = Date.now();
+          setLiveSessionsMap((prev) => ({
+            ...prev,
+            [msg.session_id]: { frame: msg, lastSeen: now },
+          }));
 
-          // If current lap advanced (lap 1 ended, lap 2 started), refresh laps from DB
-          if (msg.current_lap > lastLapRef.current) {
+          // If no session is currently selected, auto-select this live session
+          setSessionId((prev) => (!prev ? msg.session_id : prev));
+
+          // If current lap advanced on the active session, refresh laps from DB
+          if (msg.session_id === sessionIdRef.current && msg.current_lap > lastLapRef.current) {
             lastLapRef.current = msg.current_lap;
-            if (msg.session_id) {
-              fetchLaps(msg.session_id).then(setLaps).catch(() => {});
-            }
+            fetchLaps(msg.session_id).then(setLaps).catch(() => {});
           }
 
-          // Accumulate live GPS points
+          // Accumulate live GPS points per session
           if (msg.frame.lat !== 0 && msg.frame.lon !== 0) {
             const newPt: TelemetryPoint = {
               lap_id: `${msg.session_id}_lap_${String(msg.current_lap).padStart(2, "0")}`,
@@ -168,8 +266,9 @@ function Index() {
               is_corner_apex: msg.frame.is_corner_apex,
             };
 
-            setLiveTrackPoints((prev) => {
-              const last = prev[prev.length - 1];
+            setLivePointsBySession((prev) => {
+              const sessionPts = prev[msg.session_id] ?? [];
+              const last = sessionPts[sessionPts.length - 1];
               if (last) {
                 // Ignore micro stationary noise (< 1.2m and < 1.5 km/h)
                 const dist = haversineMeters(last.lat, last.lon, newPt.lat, newPt.lon);
@@ -177,33 +276,25 @@ function Index() {
                   return prev;
                 }
               }
-              return [...prev, newPt];
+              return {
+                ...prev,
+                [msg.session_id]: [...sessionPts, newPt],
+              };
             });
           }
-
-          // Ensure session is in the list
-          setSessions((prev) => {
-            if (!prev.some((s) => s.session_id === msg.session_id)) {
-              return [
-                {
-                  session_id: msg.session_id,
-                  device_id: msg.device_id,
-                  track_name: msg.track_name,
-                  created_at: new Date().toISOString(),
-                },
-                ...prev,
-              ];
-            }
-            return prev;
-          });
         } else if (msg.type === "LAP_COMPLETED") {
-          if (msg.session_id) {
+          if (msg.session_id === sessionIdRef.current) {
             fetchLaps(msg.session_id).then(setLaps).catch(() => {});
           }
         } else if (msg.type === "SESSION_ENDED") {
-          setIsLive(false);
-          setLiveFrame(null);
-          loadSessions();
+          setLiveSessionsMap((prev) => {
+            const next = { ...prev };
+            delete next[msg.session_id];
+            return next;
+          });
+          if (sessionIdRef.current === msg.session_id) {
+            loadSessions();
+          }
         }
       } catch {
         // ignore malformed frames
@@ -211,7 +302,6 @@ function Index() {
     };
 
     const scheduleRetry = () => {
-      setIsLive(false);
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       retryTimerRef.current = setTimeout(() => {
         connectWs();
@@ -238,7 +328,6 @@ function Index() {
     if (!sessionId) {
       setLaps([]);
       setTelemetry([]);
-      setLiveTrackPoints([]);
       return;
     }
     const ac = new AbortController();
@@ -259,7 +348,10 @@ function Index() {
       .then(([lapData, telData]) => {
         setLaps(lapData);
         setTelemetry(telData);
-        setLiveTrackPoints(telData);
+        setLivePointsBySession((prev) => {
+          if (prev[sessionId]?.length) return prev;
+          return { ...prev, [sessionId]: telData };
+        });
         if (lapData.length > 0) {
           lastLapRef.current = Math.max(...lapData.map((l) => l.lap_number));
         }
@@ -270,8 +362,6 @@ function Index() {
   }, [sessionId]);
 
   // ── Computed values ───────────────────────────────────────────────────────
-  const isCurrentSessionLive = isLive && liveFrame?.session_id === sessionId;
-
   // Active telemetry for recorded / filtered views
   const displayedTelemetry = useMemo(() => {
     if (!selectedLapId) return telemetry;
@@ -598,7 +688,7 @@ function Index() {
   const gy = Math.max(10, Math.min(210, rawGy));
 
   // Current session object
-  const session = sessions.find((s) => s.session_id === sessionId);
+  const session = orderedSessions.find((s) => s.session_id === sessionId);
 
   // Visible laps (all | valid only: duration > 0 or lap > 1)
   const visibleLaps = validOnly
@@ -683,19 +773,19 @@ function Index() {
 
           {/* Session Selector & Refresh */}
           <div className="order-last flex w-full items-center gap-2 md:order-none md:w-[420px]">
-            {sessionsLoading && sessions.length === 0 ? (
+            {sessionsLoading && orderedSessions.length === 0 ? (
               <div className="flex h-11 flex-1 items-center gap-2 rounded-md bg-secondary px-4 text-sm text-muted-foreground">
                 <RefreshCw className="size-4 animate-spin text-accent" />
                 <span>Loading sessions…</span>
               </div>
-            ) : sessionsError && sessions.length === 0 ? (
+            ) : sessionsError && orderedSessions.length === 0 ? (
               <div className="flex h-11 flex-1 items-center justify-between rounded-md border border-destructive/50 bg-destructive/10 px-3 text-xs text-destructive">
                 <span>Failed to load sessions</span>
                 <Button size="sm" variant="ghost" onClick={() => loadSessions(true)} className="h-7 text-xs">
                   Retry
                 </Button>
               </div>
-            ) : sessions.length === 0 ? (
+            ) : orderedSessions.length === 0 ? (
               <div className="flex h-11 flex-1 items-center rounded-md bg-secondary px-4 text-sm text-muted-foreground">
                 No sessions found in database
               </div>
@@ -711,13 +801,18 @@ function Index() {
                   <SelectValue placeholder="Select session…" />
                 </SelectTrigger>
                 <SelectContent className="max-h-72">
-                  {sessions.map((s) => {
-                    const isSessionLive = liveFrame?.session_id === s.session_id;
+                  {orderedSessions.map((s) => {
+                    const isSessionLive = !!liveSessionsMap[s.session_id];
                     return (
                       <SelectItem key={s.session_id} value={s.session_id}>
                         <div className="flex items-center gap-2 py-0.5">
-                          {isSessionLive && (
-                            <span className="size-2 rounded-full bg-green-500 animate-pulse" />
+                          {isSessionLive ? (
+                            <span className="flex items-center gap-1 font-semibold text-green-400">
+                              <span className="size-2 rounded-full bg-green-500 animate-pulse" />
+                              LIVE
+                            </span>
+                          ) : (
+                            <span className="size-1.5 rounded-full bg-muted-foreground/30" />
                           )}
                           <span className="font-medium text-foreground">
                             {s.track_name || "Unknown Track"}
@@ -753,20 +848,25 @@ function Index() {
             {isCurrentSessionLive ? (
               <span className="flex items-center gap-2 rounded-full border border-green-500/30 bg-green-500/10 px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-green-400">
                 <span className="size-2 rounded-full animate-pulse bg-green-500" />
-                ● LIVE
+                ● LIVE {liveFrame ? `· ${liveFrame.device_id}` : ""}
               </span>
-            ) : liveFrame ? (
+            ) : Object.keys(liveSessionsMap).length > 0 ? (
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  setSessionId(liveFrame.session_id);
-                  setSelectedLapId(null);
+                  const firstLiveId = Object.keys(liveSessionsMap)[0];
+                  if (firstLiveId) {
+                    setSessionId(firstLiveId);
+                    setSelectedLapId(null);
+                  }
                 }}
                 className="h-8 gap-2 rounded-full border-green-500/40 bg-green-500/10 px-3 font-mono text-[11px] text-green-400 hover:bg-green-500/20"
               >
                 <span className="size-2 rounded-full animate-pulse bg-green-500" />
-                Live streaming · View
+                {Object.keys(liveSessionsMap).length > 1
+                  ? `${Object.keys(liveSessionsMap).length} Live sessions · View`
+                  : "Live streaming · View"}
               </Button>
             ) : (
               <span className="flex items-center gap-2 rounded-full border border-border px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
