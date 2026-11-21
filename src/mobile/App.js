@@ -25,6 +25,7 @@ export default function App() {
   const ws = useRef(null);
   const isRunningRef = useRef(false);
   const imuBuffer = useRef([]);
+  const retryQueue = useRef([]);
   const latestGps = useRef({ lat: 0, lon: 0, speed: 0, bearing: 0 });
   const latestGyro = useRef({ x: 0, y: 0, z: 0 });
   const calibrationOffset = useRef({ x: 0, y: 0, z: 0 });
@@ -39,6 +40,18 @@ export default function App() {
     let sendInterval = null;
     let reconnectTimeout = null;
 
+    const flushRetryQueue = () => {
+      while (retryQueue.current.length > 0 && ws.current && ws.current.readyState === WebSocket.OPEN) {
+        const queued = retryQueue.current.shift();
+        try {
+          ws.current.send(JSON.stringify(queued));
+        } catch (err) {
+          retryQueue.current.unshift(queued);
+          break;
+        }
+      }
+    };
+
     const connectWebSocket = () => {
       if (!isRunningRef.current) return;
 
@@ -51,6 +64,7 @@ export default function App() {
 
       ws.current.onopen = () => {
         setStatusText('● LIVE - Se înregistrează');
+        flushRetryQueue();
       };
 
       ws.current.onerror = () => {
@@ -59,7 +73,12 @@ export default function App() {
 
       ws.current.onclose = () => {
         if (isRunningRef.current) {
-          setStatusText('Semnal slab - Reconectare...');
+          const qCount = retryQueue.current.length;
+          setStatusText(
+            qCount > 0
+              ? `Buffer offline (${qCount}) - Reconectare...`
+              : 'Semnal slab - Reconectare...'
+          );
           reconnectTimeout = setTimeout(connectWebSocket, 1000);
         }
       };
@@ -77,6 +96,7 @@ export default function App() {
 
       sessionIdRef.current = `ses_${Date.now()}`;
       imuBuffer.current = [];
+      retryQueue.current = [];
       isCalibrated.current = false;
 
       connectWebSocket();
@@ -129,35 +149,75 @@ export default function App() {
       });
 
       sendInterval = setInterval(() => {
-        if (ws.current && ws.current.readyState === WebSocket.OPEN && imuBuffer.current.length > 0) {
+        if (imuBuffer.current.length === 0 && retryQueue.current.length === 0) return;
+
+        let payload = null;
+        if (imuBuffer.current.length > 0) {
           const samplesToSend = [...imuBuffer.current];
           imuBuffer.current = [];
 
-          const payload = {
+          payload = {
             session_id: sessionIdRef.current,
             device_id: driverName.trim() || 'S23-Driver',
             track_name: trackName.trim() || 'Default-Track',
             event_type: 'telemetry_batch',
-            timestamp: new Date().toISOString(),
+            timestamp: new Date().toISOString(), // UTC ISO-8601
+            unit: {
+              accel: 'g',
+              gyro: 'rad/s',
+              speed: 'm/s',
+              bearing: 'deg',
+            },
+            value: {
+              gps: latestGps.current,
+              samples: samplesToSend,
+            },
             gps: latestGps.current,
             samples: samplesToSend,
           };
+        }
 
-          ws.current.send(JSON.stringify(payload));
+        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+          flushRetryQueue();
+          if (payload) {
+            try {
+              ws.current.send(JSON.stringify(payload));
+            } catch (err) {
+              retryQueue.current.push(payload);
+            }
+          }
+        } else if (payload) {
+          retryQueue.current.push(payload);
+          if (retryQueue.current.length > 300) {
+            retryQueue.current.shift();
+          }
+          if (isRunningRef.current) {
+            setStatusText(`Buffer offline (${retryQueue.current.length}) - Reconectare...`);
+          }
         }
       }, 200);
     };
 
     const stopTelemetry = () => {
+      const stopPayload = {
+        session_id: sessionIdRef.current,
+        device_id: driverName.trim() || 'S23-Driver',
+        event_type: 'STOP_SESSION',
+        timestamp: new Date().toISOString(),
+        unit: 'event',
+        value: 'session_completed',
+      };
+
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.send(
-          JSON.stringify({
-            session_id: sessionIdRef.current,
-            event_type: 'STOP_SESSION',
-            timestamp: new Date().toISOString(),
-          })
-        );
+        flushRetryQueue();
+        try {
+          ws.current.send(JSON.stringify(stopPayload));
+        } catch (e) {
+          console.warn('Failed to send STOP_SESSION', e);
+        }
         ws.current.close();
+      } else {
+        if (ws.current) ws.current.close();
       }
       deactivateKeepAwake();
       if (sessionIdRef.current) {
