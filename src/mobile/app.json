@@ -5,14 +5,21 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "scheme": "telemetryapp",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.diodele.telemetryapp",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Aplicația colectează coordonatele GPS și viteza pentru telemetria circuitului F1.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Aplicația colectează locația GPS în fundal în timpul rulării pe circuit.",
+        "NSMotionUsageDescription": "Aplicația citește forțele G (accelerometru și giroscop) pentru telemetria dinamicii mașinii."
+      }
     },
     "android": {
       "package": "com.diodele.telemetryapp",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#121212",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
