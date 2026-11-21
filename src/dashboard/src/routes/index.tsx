@@ -554,41 +554,6 @@ function Index() {
   const isReplaying =
     !isCurrentSessionLive && replayTimeMs !== null && displayedTelemetry.length > 1;
 
-  // ── Exact Replay Point: calculated from smoothFullTrack (identical to the white hover point) ──
-  const currentReplayPoint = useMemo(() => {
-    if (!isReplaying || replayTimeMs === null) return null;
-    const trackSource = smoothFullTrack.length > 0 ? smoothFullTrack : fullProjectedTrack;
-    if (trackSource.length === 0) return null;
-
-    const targetMs = baseTimeMs + replayTimeMs;
-
-    let low = 0;
-    let high = trackSource.length - 1;
-    while (low <= high) {
-      const mid = (low + high) >> 1;
-      const ptTime = trackSource[mid]!.timeMs ?? 0;
-      if (ptTime <= targetMs) {
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    const idx = Math.max(0, Math.min(trackSource.length - 1, high));
-    const pt = trackSource[idx]!;
-    const g_lat = pt.g_lat ?? 0;
-    const g_lon = pt.g_lon ?? 0;
-    return {
-      ...pt,
-      index: idx,
-      speed_kmh: pt.speed,
-      g_lat,
-      g_lon,
-      total_g: Number(Math.hypot(g_lat, g_lon).toFixed(2)),
-    };
-  }, [isReplaying, replayTimeMs, smoothFullTrack, fullProjectedTrack, baseTimeMs]);
-
-  const currentReplayFrame = currentReplayPoint;
-
   // ── Reference Track: the established circuit path ────────────────────────
   // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
   // From Lap 2 onwards (or for recorded sessions), referenceTrack holds Lap 1 points (the circuit layout).
@@ -660,6 +625,41 @@ function Index() {
   const smoothFullTrack = useMemo(() => {
     return interpolateTrackSpline(fullProjectedTrack, isClosedLoop, 4);
   }, [fullProjectedTrack, isClosedLoop]);
+
+  // ── Exact Replay Point: calculated from smoothFullTrack (identical to the white hover point) ──
+  const currentReplayPoint = useMemo(() => {
+    if (!isReplaying || replayTimeMs === null) return null;
+    const trackSource = smoothFullTrack.length > 0 ? smoothFullTrack : fullProjectedTrack;
+    if (trackSource.length === 0) return null;
+
+    const targetMs = baseTimeMs + replayTimeMs;
+
+    let low = 0;
+    let high = trackSource.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const ptTime = trackSource[mid]!.timeMs ?? 0;
+      if (ptTime <= targetMs) {
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    const idx = Math.max(0, Math.min(trackSource.length - 1, high));
+    const pt = trackSource[idx]!;
+    const g_lat = pt.g_lat ?? 0;
+    const g_lon = pt.g_lon ?? 0;
+    return {
+      ...pt,
+      index: idx,
+      speed_kmh: pt.speed,
+      g_lat,
+      g_lon,
+      total_g: Number(Math.hypot(g_lat, g_lon).toFixed(2)),
+    };
+  }, [isReplaying, replayTimeMs, smoothFullTrack, fullProjectedTrack, baseTimeMs]);
+
+  const currentReplayFrame = currentReplayPoint;
 
   // Smooth 60 FPS Track Position for Replay (interpolates continuously along waypoints)
   const replayTrackPos = useMemo(() => {
