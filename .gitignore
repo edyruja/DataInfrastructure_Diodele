@@ -1,4 +1,4 @@
-﻿# Secrete si variabile locale
+# Secrete si variabile locale
 .env
 .env.local
 .dev.vars
@@ -9,6 +9,7 @@
 node_modules/
 dist/
 build/
+.output/
 .wrangler/
 .terraform/
 *.tfstate
