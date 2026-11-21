@@ -16,3 +16,15 @@ variable "d1_database_name" {
   type        = string
   default     = "pero_diodele"
 }
+
+variable "worker_name" {
+  description = "Numele worker-ului Cloudflare de telemetrie"
+  type        = string
+  default     = "telemetry-worker"
+}
+
+variable "dashboard_name" {
+  description = "Numele proiectului Cloudflare pentru dashboard"
+  type        = string
+  default     = "diodele-dashboard"
+}

@@ -4,3 +4,5 @@
 cloudflare_account_id = "your_cloudflare_account_id_here"
 cloudflare_api_token  = "your_cloudflare_api_token_here"
 d1_database_name      = "pero_diodele"
+worker_name           = "telemetry-worker"
+dashboard_name        = "diodele-dashboard"
