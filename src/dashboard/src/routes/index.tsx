@@ -358,6 +358,17 @@ function Index() {
         });
         if (lapData.length > 0) {
           lastLapRef.current = Math.max(...lapData.map((l) => l.lap_number));
+          // Automatically select the best valid completed lap by default
+          const validCandidates = lapData.filter((l) => isLapValid(l, lapData, telData));
+          const best = validCandidates.reduce<ApiLap | null>(
+            (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
+            null,
+          );
+          if (best) {
+            setSelectedLapId(best.lap_id);
+          } else {
+            setSelectedLapId(lapData[0]!.lap_id);
+          }
         }
       })
       .finally(() => setLoading(false));
@@ -366,11 +377,34 @@ function Index() {
   }, [sessionId]);
 
   // ── Computed values ───────────────────────────────────────────────────────
+  // Filter completed and valid laps only (incomplete or aborted laps under 15s are excluded)
+  const validLaps = useMemo(() => {
+    return laps.filter((l) => isLapValid(l, laps, telemetry));
+  }, [laps, telemetry]);
+
+  const bestLap = useMemo(() => {
+    return validLaps.reduce<ApiLap | null>(
+      (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
+      null,
+    );
+  }, [validLaps]);
+
+  // Effective active lap: in recorded mode, defaults to the best completed lap!
+  const effectiveLapId = useMemo(() => {
+    if (isCurrentSessionLive) return null;
+    if (selectedLapId) return selectedLapId;
+    return bestLap?.lap_id ?? (laps.length > 0 ? laps[0]?.lap_id : null);
+  }, [isCurrentSessionLive, selectedLapId, bestLap, laps]);
+
   // Active telemetry for recorded / filtered views
   const displayedTelemetry = useMemo(() => {
-    if (!selectedLapId) return telemetry;
-    return telemetry.filter((p) => p.lap_id === selectedLapId);
-  }, [telemetry, selectedLapId]);
+    if (isCurrentSessionLive) return telemetry;
+    if (effectiveLapId) {
+      const filtered = telemetry.filter((p) => p.lap_id === effectiveLapId);
+      if (filtered.length > 0) return filtered;
+    }
+    return telemetry;
+  }, [isCurrentSessionLive, effectiveLapId, telemetry]);
 
   // Duration and base time of current displayed telemetry
   const baseTimeMs = useMemo(() => {
@@ -448,8 +482,9 @@ function Index() {
     // 1. Recorded session from database:
     if (!isCurrentSessionLive) {
       if (telemetry.length === 0) return [];
-      if (selectedLapId) {
-        return telemetry.filter((p) => p.lap_id === selectedLapId);
+      if (effectiveLapId) {
+        const lapPts = telemetry.filter((p) => p.lap_id === effectiveLapId);
+        if (lapPts.length > 8) return lapPts;
       }
       const lap1 = telemetry.filter((p) => p.lap_number === 1);
       return lap1.length > 8 ? lap1 : telemetry;
@@ -707,18 +742,6 @@ function Index() {
 
   // Overall points buffer for KPIs
   const allPoints = isCurrentSessionLive ? liveTrackPoints : telemetry;
-
-  // Filter completed and valid laps only (incomplete or aborted laps under 15s are excluded)
-  const validLaps = useMemo(() => {
-    return laps.filter((l) => isLapValid(l, laps, telemetry));
-  }, [laps, telemetry]);
-
-  const bestLap = useMemo(() => {
-    return validLaps.reduce<ApiLap | null>(
-      (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
-      null,
-    );
-  }, [validLaps]);
 
   const maxSpeed = useMemo(() => {
     const liveSpeed = isCurrentSessionLive && liveFrame ? liveFrame.frame.speed_kmh : 0;
@@ -1229,9 +1252,10 @@ function Index() {
                     {fullProjectedTrack.length > 0 ? `${fullProjectedTrack.length} pts` : "No data"}
                   </span>
                 )}
-                {selectedLapId && (
+                {(selectedLapId || effectiveLapId) && (
                   <span className="rounded-full bg-accent/20 px-2.5 py-0.5 text-xs text-accent font-mono">
-                    Lap {laps.find((l) => l.lap_id === selectedLapId)?.lap_number ?? ""}
+                    Lap {laps.find((l) => l.lap_id === (selectedLapId ?? effectiveLapId))?.lap_number ?? ""}
+                    {bestLap && (selectedLapId ?? effectiveLapId) === bestLap.lap_id ? " · Best" : ""}
                   </span>
                 )}
               </div>
@@ -1695,7 +1719,7 @@ function Index() {
                   : visibleLaps.map((lap) => {
                       const isValid = isLapValid(lap, laps, telemetry);
                       const isBest = isValid && bestLap?.lap_id === lap.lap_id;
-                      const isSelected = selectedLapId === lap.lap_id;
+                      const isSelected = (selectedLapId ?? effectiveLapId) === lap.lap_id;
                       const delta =
                         isValid && bestLap && !isBest && lap.duration_ms > 0
                           ? formatDelta(lap.duration_ms - bestLap.duration_ms)
