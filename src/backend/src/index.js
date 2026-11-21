@@ -2,7 +2,7 @@
 // Physics & Geo Metrics Helpers (Self-contained for Terraform / Worker bundle)
 // ---------------------------------------------------------------------------
 
-export function computeSampleSliceMetrics(slice, speedKmh) {
+export function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
   if (!slice || slice.length === 0) {
     return {
       g_lat: 0,
@@ -21,17 +21,51 @@ export function computeSampleSliceMetrics(slice, speedKmh) {
   const avgAz = slice.reduce((s, p) => s + (p.az || 0), 0) / len;
   const avgGz = slice.reduce((s, p) => s + Math.abs(p.gz || 0), 0) / len;
 
-  const totalG = Math.sqrt(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
-  const absGLat = Number(Math.abs(avgAx).toFixed(3));
-  const gBrake = avgAy < 0 ? Number(Math.abs(avgAy).toFixed(3)) : 0;
-  const isCornerApex = absGLat > 0.35 || avgGz > 0.35 ? 1 : 0;
+  // 1. Forța G REALĂ totală din senzorii fizici (magnitudinea 3D a accelerometrului)
+  const sensorMag = Math.sqrt(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
+  const totalG = Number(sensorMag.toFixed(3));
+
+  let gLat = 0;
+  let gLon = 0;
+  let gBrake = 0;
+
+  // 2. Aliniem forța G reală pe direcția de mers (bearing) doar dacă mașina e în mișcare (> 3 km/h)
+  // Astfel eliminăm orice distorsiune când miști telefonul în mână pe loc!
+  if ((speedKmh || 0) > 3) {
+    const speedMps = (speedKmh || 0) / 3.6;
+    const aLatKinematic = Math.abs(speedMps * avgGz);
+    const aLonKinematic = Math.abs(accelGps);
+    const kNorm = Math.sqrt(aLonKinematic * aLonKinematic + aLatKinematic * aLatKinematic);
+
+    if (kNorm > 0.08) {
+      // Împărțim forța G reală pe axa longitudinală (față/frânare) și axa laterală (viraj)
+      const ratioLat = aLatKinematic / kNorm;
+      const ratioLon = aLonKinematic / kNorm;
+
+      const dynamicGLat = sensorMag * ratioLat;
+      const dynamicGLon = sensorMag * ratioLon * (accelGps >= 0 ? 1 : -1);
+
+      gLat = Number(dynamicGLat.toFixed(3));
+      gLon = Number(dynamicGLon.toFixed(3));
+      // Frânarea reală: când accelerația pe direcția de mers este negativă (opusă înaintării)
+      gBrake = dynamicGLon < 0 ? Number(Math.abs(dynamicGLon).toFixed(3)) : 0;
+    } else {
+      // Viteză constantă în linie dreaptă
+      gLat = Number((Math.abs(avgAx) * 0.2).toFixed(3));
+      gLon = 0;
+      gBrake = 0;
+    }
+  }
+
+  const absGLat = Number(Math.abs(gLat).toFixed(3));
+  const isCornerApex = (absGLat > 0.35 || avgGz > 0.35) && (speedKmh || 0) > 10 ? 1 : 0;
 
   return {
-    g_lat: Number(avgAx.toFixed(3)),
-    g_lon: Number(avgAy.toFixed(3)),
+    g_lat: gLat,
+    g_lon: gLon,
     abs_g_lat: absGLat,
     g_brake: gBrake,
-    total_g: Number(totalG.toFixed(3)),
+    total_g: totalG,
     is_corner_apex: isCornerApex,
     speed_kmh: speedKmh || 0,
   };
@@ -148,6 +182,16 @@ export class TelemetryHub {
 
     const gps = data.gps || { lat: 0, lon: 0, speed: 0, bearing: 0 };
     const speedKmh = Number((gps.speed * 3.6).toFixed(1));
+    const currentSpeedMps = gps.speed || 0;
+
+    // Calculăm accelerația pe direcția de mers din variația de viteză GPS
+    const lastSpeedMps = ses.lastSpeedMps !== undefined ? ses.lastSpeedMps : currentSpeedMps;
+    const lastGpsTs = ses.lastGpsTs || lastSampleTs;
+    const dtSeconds = Math.max(0.05, (lastSampleTs - lastGpsTs) / 1000);
+    const accelGps = (currentSpeedMps - lastSpeedMps) / dtSeconds;
+
+    ses.lastSpeedMps = currentSpeedMps;
+    ses.lastGpsTs = lastSampleTs;
 
     if (ses.startLat === 0 && gps.lat !== 0 && gps.lon !== 0) {
       ses.startLat = gps.lat;
@@ -161,7 +205,7 @@ export class TelemetryHub {
       const slice = data.samples.slice(i, i + chunkSize);
       if (slice.length === 0) continue;
 
-      const m = computeSampleSliceMetrics(slice, speedKmh);
+      const m = computeSampleSliceMetrics(slice, speedKmh, accelGps, gps.bearing || 0);
 
       if (speedKmh > ses.lapMaxSpeed) ses.lapMaxSpeed = speedKmh;
       ses.lapSpeedSum += speedKmh;
