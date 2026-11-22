@@ -290,63 +290,15 @@ async function readSessionTelemetry(sessionId, env) {
 
 const legacyLapPrefix = (sessionId) => `${sessionId}_lap_`;
 const LEGACY_LAP_NUMBER = "COALESCE(l.lap_number, CAST(substr(tp.lap_id, length(?) + 1) AS INTEGER))";
-async function saveCompletedLap(ses, endTs, env) {
-  await flushPointsToD1(ses, env);
-  const lapId = `${ses.sessionId}_lap_${String(ses.lapNumber).padStart(2, "0")}`;
-  const durationMs = Math.max(0, endTs - ses.lapStartTime);
-
-  // Agregare matematică sigură direct peste punctele salvate în D1
-  let maxSpeed = ses.lapMaxSpeed || 0;
-  let avgSpeed = ses.lapPointCount > 0 ? Number((ses.lapSpeedSum / ses.lapPointCount).toFixed(1)) : 0;
-  let maxGLat = Number((ses.lapMaxGLat || 0).toFixed(2));
-  let maxGBrake = Number((ses.lapMaxGBrake || 0).toFixed(2));
-
+// Deployments may reach the Worker before the additive D1 schema is applied.
+async function readWithLegacySchema(read, fallback) {
   try {
-    const { results: agg } = await env.DB.prepare(
-      `SELECT 
-         MAX(speed_kmh) as max_spd, 
-         AVG(speed_kmh) as avg_spd, 
-         MAX(ABS(g_lat)) as max_glat, 
-         MIN(g_lon) as min_glon 
-       FROM telemetry_points 
-       WHERE lap_id = ?`
-    )
-      .bind(lapId)
-      .all();
-
-    if (agg && agg.length > 0) {
-      if (agg[0].max_spd !== null && agg[0].max_spd !== undefined) {
-        maxSpeed = Math.max(maxSpeed, agg[0].max_spd);
-      }
-      if (agg[0].avg_spd !== null && agg[0].avg_spd !== undefined) {
-        avgSpeed = Number(agg[0].avg_spd.toFixed(1));
-      }
-      if (agg[0].max_glat !== null && agg[0].max_glat !== undefined) {
-        maxGLat = Number(Math.max(maxGLat, agg[0].max_glat).toFixed(2));
-      }
-      if (agg[0].min_glon !== null && agg[0].min_glon !== undefined) {
-        const brake = agg[0].min_glon < 0 ? Math.abs(agg[0].min_glon) : 0;
-        maxGBrake = Number(Math.max(maxGBrake, brake).toFixed(2));
-      }
-    }
-  } catch (err) {
-    console.error("Aggregation error in saveCompletedLap:", err);
+    return await read();
+  } catch (error) {
+    const message = `${error?.message ?? error} ${error?.cause?.message ?? ""}`;
+    if (!/no such table: (?:main\.)?telemetry_(?:batches|stops)\b/i.test(message)) throw error;
+    return fallback();
   }
-
-  await env.DB.prepare(
-    "INSERT OR REPLACE INTO laps (lap_id, session_id, lap_number, duration_ms, max_speed_kmh, avg_speed_kmh, max_g_lat, max_g_brake) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  )
-    .bind(
-      lapId,
-      ses.sessionId,
-      ses.lapNumber,
-      durationMs,
-      maxSpeed,
-      avgSpeed,
-      maxGLat,
-      maxGBrake
-    )
-    .run();
 }
 
 // ---------------------------------------------------------------------------
@@ -385,13 +337,21 @@ export default {
     }
 
     if (url.pathname === "/api/sessions" || url.pathname === "/sessions") {
-      const { results } = await env.DB.prepare(
-        `SELECT s.session_id, s.device_id, s.track_name, s.created_at,
-                COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts,
-                (SELECT MAX(tb.id) FROM telemetry_batches tb WHERE tb.session_id = s.session_id) AS telemetry_revision
-         FROM sessions s LEFT JOIN telemetry_stops st USING (session_id)
-         ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 50`
-      ).all();
+      const { results } = await readWithLegacySchema(
+        () => env.DB.prepare(
+          `SELECT s.session_id, s.device_id, s.track_name, s.created_at,
+                  COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts,
+                  (SELECT MAX(tb.id) FROM telemetry_batches tb WHERE tb.session_id = s.session_id) AS telemetry_revision
+           FROM sessions s LEFT JOIN telemetry_stops st USING (session_id)
+           ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 50`
+        ).all(),
+        () => env.DB.prepare(
+          `SELECT session_id, device_id, track_name, created_at,
+                  COALESCE(updated_at, created_at) AS updated_at,
+                  NULL AS stop_ts, NULL AS telemetry_revision
+           FROM sessions ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50`
+        ).all()
+      );
       return Response.json(results, { headers: corsHeaders });
     }
 
@@ -404,74 +364,26 @@ export default {
       const lastMs = Math.min(60_000, Math.max(1, Number(url.searchParams.get("last_ms")) || 2000));
 
       if (action === "live") {
-        const { results } = await env.DB.prepare(
-          `SELECT COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts
-           FROM sessions s LEFT JOIN telemetry_stops st USING (session_id) WHERE s.session_id = ?`
-        ).bind(sessionId).all();
+        const { results } = await readWithLegacySchema(
+          () => env.DB.prepare(
+            `SELECT COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts
+             FROM sessions s LEFT JOIN telemetry_stops st USING (session_id) WHERE s.session_id = ?`
+          ).bind(sessionId).all(),
+          () => env.DB.prepare(
+            `SELECT COALESCE(updated_at, created_at) AS updated_at, NULL AS stop_ts
+             FROM sessions WHERE session_id = ?`
+          ).bind(sessionId).all()
+        );
         const session = results[0];
         if (!session || session.stop_ts != null || !(Date.now() - Date.parse(session.updated_at) <= 12_000)) {
           return Response.json([], { headers: { ...corsHeaders, "X-Session-Status": "offline" } });
         }
       }
-    const lapsMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/laps$/);
-    if (lapsMatch) {
-      const sessionId = decodeURIComponent(lapsMatch[2]);
-      const { results } = await env.DB.prepare(
-        `SELECT 
-           l.lap_id,
-           l.session_id,
-           l.lap_number,
-           l.duration_ms,
-           ROUND(MAX(COALESCE(l.max_speed_kmh, 0), COALESCE(agg.max_spd, 0)), 1) as max_speed_kmh,
-           ROUND(COALESCE(agg.avg_spd, l.avg_speed_kmh, 0), 1) as avg_speed_kmh,
-           ROUND(MAX(COALESCE(ABS(l.max_g_lat), 0), COALESCE(agg.max_glat, 0)), 2) as max_g_lat,
-           ROUND(MAX(COALESCE(ABS(l.max_g_brake), 0), COALESCE(agg.max_gbrake, 0)), 2) as max_g_brake
-         FROM laps l
-         LEFT JOIN (
-           SELECT 
-             lap_id,
-             MAX(speed_kmh) as max_spd,
-             AVG(speed_kmh) as avg_spd,
-             MAX(ABS(g_lat)) as max_glat,
-             MAX(CASE WHEN g_lon < 0 THEN ABS(g_lon) ELSE 0 END) as max_gbrake
-           FROM telemetry_points
-           GROUP BY lap_id
-         ) agg ON l.lap_id = agg.lap_id
-         WHERE l.session_id = ?
-         ORDER BY l.lap_number ASC`
-      )
-        .bind(sessionId)
-        .all();
-      return Response.json(results, { headers: corsHeaders });
-    }
 
-    const telemetryMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/telemetry$/);
-    if (telemetryMatch) {
-      const sessionId = decodeURIComponent(telemetryMatch[2]);
-      const { results } = await env.DB.prepare(
-        `SELECT tp.*, COALESCE(l.lap_number, 1) as lap_number
-         FROM telemetry_points tp
-         LEFT JOIN laps l ON tp.lap_id = l.lap_id
-         WHERE l.session_id = ? OR tp.lap_id LIKE ?
-         ORDER BY COALESCE(l.lap_number, 1) ASC, tp.lap_offset_ms ASC, tp.id ASC`
-      )
-        .bind(sessionId, `${sessionId}%`)
-        .all();
-      return Response.json(results, { headers: corsHeaders });
-    }
-
-    const lapPointsMatch = url.pathname.match(/^(\/api)?\/laps\/([^/]+)\/telemetry$/);
-    if (lapPointsMatch) {
-      const lapId = decodeURIComponent(lapPointsMatch[2]);
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM telemetry_points WHERE lap_id = ? ORDER BY lap_offset_ms ASC, id ASC"
-      )
-        .bind(lapId)
-        .all();
-      return Response.json(results, { headers: corsHeaders });
-    }
-
-      const recorded = await readSessionTelemetry(sessionId, env);
+      const recorded = await readWithLegacySchema(
+        () => readSessionTelemetry(sessionId, env),
+        () => null
+      );
       if (recorded) {
         if (action === "laps") return Response.json(recorded.laps, { headers: corsHeaders });
         if (action === "telemetry") return Response.json(recorded.points, { headers: corsHeaders });
@@ -487,8 +399,14 @@ export default {
       if (action === "laps") {
         const { results } = await env.DB.prepare(
           `SELECT l.lap_id, l.session_id, l.lap_number, l.duration_ms,
-                  l.max_speed_kmh, l.avg_speed_kmh, l.max_g_lat, l.max_g_brake,
-                  NULL AS is_complete, NULL AS is_valid FROM laps l WHERE l.session_id = ?
+                  ROUND(MAX(COALESCE(l.max_speed_kmh, 0), COALESCE(MAX(tp.speed_kmh), 0)), 1) AS max_speed_kmh,
+                  ROUND(COALESCE(AVG(tp.speed_kmh), l.avg_speed_kmh, 0), 1) AS avg_speed_kmh,
+                  ROUND(MAX(COALESCE(ABS(l.max_g_lat), 0), COALESCE(MAX(ABS(tp.g_lat)), 0)), 2) AS max_g_lat,
+                  ROUND(MAX(COALESCE(ABS(l.max_g_brake), 0), COALESCE(-MIN(tp.g_lon), 0)), 2) AS max_g_brake,
+                  NULL AS is_complete, NULL AS is_valid
+           FROM laps l LEFT JOIN telemetry_points tp ON l.lap_id = tp.lap_id
+           WHERE l.session_id = ?
+           GROUP BY l.lap_id
            UNION ALL
            SELECT tp.lap_id, ?, ${LEGACY_LAP_NUMBER}, MAX(tp.lap_offset_ms),
                   COALESCE(MAX(tp.speed_kmh), 0), COALESCE(ROUND(AVG(tp.speed_kmh), 1), 0),
@@ -534,7 +452,10 @@ export default {
       const lapId = decodeURIComponent(lapMatch[2]);
       const sessionId = /^(.*)_lap_\d+$/.exec(lapId)?.[1];
       if (sessionId) {
-        const recorded = await readSessionTelemetry(sessionId, env);
+        const recorded = await readWithLegacySchema(
+          () => readSessionTelemetry(sessionId, env),
+          () => null
+        );
         if (recorded) {
           return Response.json(recorded.points.filter((point) => point.lap_id === lapId), { headers: corsHeaders });
         }
