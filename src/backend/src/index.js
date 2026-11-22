@@ -2,20 +2,10 @@
 // Physics & Geo Metrics Helpers (Self-contained for Terraform / Worker bundle)
 // ---------------------------------------------------------------------------
 
-function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
-  if (!slice || slice.length === 0) {
-    return { g_lat: 0, g_lon: 0, abs_g_lat: 0, g_brake: 0, total_g: 0, is_corner_apex: 0, speed_kmh: speedKmh || 0 };
-  }
-
-  const len = slice.length;
-  const avgAx = slice.reduce((s, p) => s + (p.ax || 0), 0) / len;
-  const avgAy = slice.reduce((s, p) => s + (p.ay || 0), 0) / len;
-  const avgAz = slice.reduce((s, p) => s + (p.az || 0), 0) / len;
-  const avgGzSigned = slice.reduce((s, p) => s + (p.gz || 0), 0) / len;
+function computeSampleSliceMetrics(avgAx, avgAy, avgAz, avgGzSigned, speedKmh, accelGps) {
   const avgGz = Math.abs(avgGzSigned);
 
   const sensorMag = Math.sqrt(avgAx * avgAx + avgAy * avgAy + avgAz * avgAz);
-  const totalG = Number(sensorMag.toFixed(3));
 
   let gLat = 0;
   let gLon = 0;
@@ -56,7 +46,7 @@ function computeSampleSliceMetrics(slice, speedKmh, accelGps = 0, bearing = 0) {
   const absGLat = Number(Math.abs(gLat).toFixed(3));
   const isCornerApex = (absGLat > 0.35 || avgGz > 0.35) && (speedKmh || 0) > 10 ? 1 : 0;
 
-  return { g_lat: gLat, g_lon: gLon, abs_g_lat: absGLat, g_brake: gBrake, total_g: totalG, is_corner_apex: isCornerApex, speed_kmh: speedKmh || 0 };
+  return { g_lat: gLat, g_lon: gLon, abs_g_lat: absGLat, g_brake: gBrake, is_corner_apex: isCornerApex, speed_kmh: speedKmh || 0 };
 }
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
@@ -71,208 +61,235 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ---------------------------------------------------------------------------
-// In-memory session state for Consumer processing (per Worker instance)
-// ---------------------------------------------------------------------------
-
-const sessionStore = new Map();
-
-// ---------------------------------------------------------------------------
-// CONSUMER: processBatch — toată logica de calcule și scriere în D1
-// ---------------------------------------------------------------------------
-
-async function processBatchConsumer(data, env) {
+// Store the input before deriving laps. Queue delivery can be late, duplicated,
+// or distributed across independent Worker instances.
+function storeMessage(data, env) {
+  if (typeof data?.session_id !== "string" || !data.session_id) return [];
   const sessionId = data.session_id;
-  const trackName = data.track_name || "Default-Track";
-  const deviceId = data.device_id || "S23-Driver";
-
-  // STOP_SESSION: finalizăm sesiunea și scriem ultimul tur
   if (data.event_type === "STOP_SESSION") {
-    const ses = sessionStore.get(sessionId);
-    if (ses) {
-      await saveCompletedLap(ses, ses.lastSampleTs, env);
-      sessionStore.delete(sessionId);
-    }
-    return;
+    const stopTs = Date.parse(data.timestamp ?? "");
+    if (!Number.isSafeInteger(stopTs)) return [];
+    return [env.DB.prepare(
+      `INSERT INTO telemetry_stops (session_id, stop_ts) VALUES (?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET stop_ts = MIN(telemetry_stops.stop_ts, excluded.stop_ts)`
+    ).bind(sessionId, stopTs)];
   }
 
-  if (data.event_type !== "telemetry_batch" || !Array.isArray(data.samples) || data.samples.length === 0) {
-    return;
+  if (data.event_type !== "telemetry_batch" || !Array.isArray(data.samples)) return [];
+  const samples = data.samples
+    .filter((sample) => Number.isSafeInteger(sample?.ts) && sample.ts > 0 && sample.ts < 8.64e15)
+    .sort((a, b) => a.ts - b.ts);
+  if (!samples.length) return [];
+
+  const firstTs = samples[0].ts;
+  const lastTs = samples.at(-1).ts;
+  const declaredStart = Number(/^ses_(\d{13})(?:_|$)/.exec(sessionId)?.[1]);
+  const startTs = declaredStart > 0 && declaredStart <= firstTs ? declaredStart : firstTs;
+  const gps = data.gps;
+  const validGps = Number.isFinite(gps?.lat) && Math.abs(gps.lat) <= 90 &&
+    Number.isFinite(gps?.lon) && Math.abs(gps.lon) <= 180 && (gps.lat !== 0 || gps.lon !== 0);
+  const lat = validGps ? gps.lat : 0;
+  const lon = validGps ? gps.lon : 0;
+  const speed = validGps && Number.isFinite(gps.speed) ? Math.max(0, gps.speed) : 0;
+  const bearing = validGps && Number.isFinite(gps.bearing) ? gps.bearing : 0;
+
+  const sliceSize = Math.max(1, Math.floor(samples.length / 4));
+  const slices = [];
+  for (let i = 0; i < samples.length; i += sliceSize) {
+    const slice = samples.slice(i, i + sliceSize);
+    // Preserve the means used by the existing G-force calculation.
+    const means = ["ax", "ay", "az", "gz"].map((key) =>
+      slice.reduce((sum, sample) => sum + (Number.isFinite(sample[key]) ? sample[key] : 0), 0) / slice.length
+    );
+    slices.push([slice.at(-1).ts, ...means]);
   }
 
-  const firstSampleTs = data.samples[0].ts;
-  const lastSampleTs = data.samples[data.samples.length - 1].ts;
+  return [
+    env.DB.prepare(
+      `INSERT INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         created_at = MIN(sessions.created_at, excluded.created_at),
+         updated_at = MAX(COALESCE(sessions.updated_at, sessions.created_at), excluded.updated_at)`
+    ).bind(sessionId,
+      typeof data.device_id === "string" && data.device_id ? data.device_id : "S23-Driver",
+      typeof data.track_name === "string" && data.track_name ? data.track_name : "Default-Track",
+      new Date(startTs).toISOString(), new Date(lastTs).toISOString()),
+    env.DB.prepare(
+      `INSERT INTO telemetry_batches (session_id, end_ts, lat, lon, speed, bearing, slices)
+       VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, end_ts) DO NOTHING`
+    ).bind(sessionId, lastTs, lat, lon, speed, bearing, JSON.stringify(slices)),
+  ];
+}
 
-  let ses = sessionStore.get(sessionId);
+const LAP_ENTRY_METERS = 15;
+const LAP_EXIT_METERS = 25;
+const MIN_LAP_MS = 15_000;
 
-  if (!ses) {
-    // 1. Extragem timestamp-ul de bază al sesiunii direct din sessionId (ex: ses_1795286789116 -> 1795286789116)
-    let sessionBaseTs = firstSampleTs;
-    const tsMatch = sessionId.match(/(\d{12,14})/);
-    if (tsMatch) {
-      sessionBaseTs = parseInt(tsMatch[1], 10);
-    }
-
-    // 2. Verificăm dacă există deja sesiunea în D1 și dacă are tururi anterioare
-    const { results: existingSes } = await env.DB.prepare(
-      "SELECT created_at FROM sessions WHERE session_id = ?"
-    )
-      .bind(sessionId)
-      .all();
-
-    if (!existingSes || existingSes.length === 0) {
-      const nowIso = new Date(sessionBaseTs).toISOString();
-      await env.DB.prepare(
-        "INSERT OR IGNORE INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-      )
-        .bind(sessionId, deviceId, trackName, nowIso, nowIso)
-        .run();
-    }
-
-    // Verificăm dacă avem deja tururi finalizate în D1 pentru această sesiune
-    const { results: existingLaps } = await env.DB.prepare(
-      "SELECT lap_number, duration_ms FROM laps WHERE session_id = ? ORDER BY lap_number ASC"
-    )
-      .bind(sessionId)
-      .all();
-
-    let lapNumber = 1;
-    let lapStartTime = sessionBaseTs;
-    if (existingLaps && existingLaps.length > 0) {
-      lapNumber = existingLaps.length + 1;
-      const totalPrevDuration = existingLaps.reduce((acc, l) => acc + (l.duration_ms || 0), 0);
-      lapStartTime = sessionBaseTs + totalPrevDuration;
-    }
-
-    // Căutăm coordonatele de start dacă au fost deja salvate în D1
-    let startLat = data.gps?.lat || 0;
-    let startLon = data.gps?.lon || 0;
-    const { results: firstPt } = await env.DB.prepare(
-      "SELECT lat, lon FROM telemetry_points WHERE lap_id LIKE ? ORDER BY id ASC LIMIT 1"
-    )
-      .bind(`${sessionId}%`)
-      .all();
-
-    if (firstPt && firstPt.length > 0 && firstPt[0].lat && firstPt[0].lon) {
-      startLat = firstPt[0].lat;
-      startLon = firstPt[0].lon;
-    }
-
-    ses = {
-      sessionId,
-      trackName,
-      deviceId,
-      sessionBaseTs,
-      startLat,
-      startLon,
-      lapNumber,
-      lapStartTime,
-      lastSampleTs,
-      leftStartZone: false,
-      lapMaxSpeed: 0,
-      lapSpeedSum: 0,
-      lapPointCount: 0,
-      lapMaxGLat: 0,
-      lapMaxGBrake: 0,
-      pointsBuffer: [],
-      lastSpeedMps: 0,
-      lastGpsTs: firstSampleTs,
-    };
-    sessionStore.set(sessionId, ses);
+function passesStart(start, previous, current, distance) {
+  if (haversineMeters(start.lat, start.lon, current.lat, current.lon) <= LAP_ENTRY_METERS) {
+    return true;
   }
+  // Also detect a pass between fixes when neither fix is inside the start zone.
+  const a = haversineMeters(start.lat, start.lon, previous.lat, previous.lon);
+  const b = haversineMeters(start.lat, start.lon, current.lat, current.lon);
+  const along = (a * a + distance * distance - b * b) / (2 * distance);
+  return along > 0 && along < distance && a * a - along * along <= LAP_ENTRY_METERS ** 2;
+}
 
-  const gps = data.gps || { lat: 0, lon: 0, speed: 0, bearing: 0 };
-  const speedKmh = Number((gps.speed * 3.6).toFixed(1));
-  const currentSpeedMps = gps.speed || 0;
+function lapIdFor(sessionId, lapNumber) {
+  return `${sessionId}_lap_${String(lapNumber).padStart(2, "0")}`;
+}
 
-  // Accelerație longitudinală din variația de viteză GPS
-  const dtSeconds = Math.max(0.05, (lastSampleTs - ses.lastGpsTs) / 1000);
-  const accelGps = (currentSpeedMps - ses.lastSpeedMps) / dtSeconds;
-  ses.lastSpeedMps = currentSpeedMps;
-  ses.lastGpsTs = lastSampleTs;
-
-  if (ses.startLat === 0 && gps.lat !== 0 && gps.lon !== 0) {
-    ses.startLat = gps.lat;
-    ses.startLon = gps.lon;
+function buildSessionTelemetry(sessionId, batches, stopTs) {
+  const rows = [];
+  let previousBatch;
+  for (const batch of batches) {
+    const dt = previousBatch ? (batch.end_ts - previousBatch.end_ts) / 1000 : 0;
+    const accelGps = dt > 0 && dt <= 2.5 && (previousBatch.lat || previousBatch.lon)
+      ? (batch.speed - previousBatch.speed) / Math.max(0.05, dt)
+      : 0;
+    previousBatch = batch;
+    const speedKmh = Number((batch.speed * 3.6).toFixed(1));
+    for (const [ts, ax, ay, az, gz] of JSON.parse(batch.slices)) {
+      if (ts > stopTs) continue;
+      rows.push({
+        ts,
+        lat: batch.lat,
+        lon: batch.lon,
+        bearing: batch.bearing,
+        ...computeSampleSliceMetrics(ax, ay, az, gz, speedKmh, accelGps),
+      });
+    }
   }
+  rows.sort((a, b) => a.ts - b.ts);
+  if (!rows.length) return { laps: [], points: [] };
 
-  const chunkSize = Math.max(1, Math.floor(data.samples.length / 4));
+  const points = [];
+  const laps = [];
+  const declaredStart = Number(/^ses_(\d{13})(?:_|$)/.exec(sessionId)?.[1]);
+  const sessionStart = declaredStart > 0 && declaredStart <= rows[0].ts ? declaredStart : rows[0].ts;
+  let lapNumber = 1;
+  let lapStart = sessionStart;
+  let lapId = lapIdFor(sessionId, lapNumber);
+  let count = 0;
+  let sumSpeed = 0;
+  let maxSpeed = 0;
+  let maxLat = 0;
+  let maxBrake = 0;
+  let start;
+  let previousFix;
+  let lastValidTs = -Infinity;
+  let traveled = 0;
+  let leftStart = false;
+  let lastTs = -1;
 
-  for (let i = 0; i < data.samples.length; i += chunkSize) {
-    const slice = data.samples.slice(i, i + chunkSize);
-    if (slice.length === 0) continue;
-
-    const m = computeSampleSliceMetrics(slice, speedKmh, accelGps, gps.bearing || 0);
-
-    if (speedKmh > ses.lapMaxSpeed) ses.lapMaxSpeed = speedKmh;
-    ses.lapSpeedSum += speedKmh;
-    ses.lapPointCount += 1;
-    if (m.abs_g_lat > ses.lapMaxGLat) ses.lapMaxGLat = m.abs_g_lat;
-    if (m.g_brake > ses.lapMaxGBrake) ses.lapMaxGBrake = m.g_brake;
-
-    const sliceEndTs = slice[slice.length - 1].ts;
-    ses.lastSampleTs = sliceEndTs;
-
-    const lapId = `${ses.sessionId}_lap_${String(ses.lapNumber).padStart(2, "0")}`;
-    const lapOffsetMs = Math.max(0, sliceEndTs - ses.lapStartTime);
-
-    ses.pointsBuffer.push({
+  function finishLap(complete) {
+    laps.push({
       lap_id: lapId,
-      lap_offset_ms: lapOffsetMs,
-      lat: gps.lat,
-      lon: gps.lon,
-      speed_kmh: speedKmh,
-      bearing: gps.bearing,
-      g_lat: m.g_lat,
-      g_lon: m.g_lon,
-      is_corner_apex: m.is_corner_apex,
+      session_id: sessionId,
+      lap_number: lapNumber,
+      duration_ms: lastTs - lapStart,
+      max_speed_kmh: maxSpeed,
+      avg_speed_kmh: Number((sumSpeed / count).toFixed(1)),
+      max_g_lat: Number(maxLat.toFixed(2)),
+      max_g_brake: Number(maxBrake.toFixed(2)),
+      is_complete: complete,
+      is_valid: complete,
     });
   }
 
-  // Detecție tur (lap detection)
-  if (ses.startLat !== 0 && gps.lat !== 0) {
-    const dist = haversineMeters(ses.startLat, ses.startLon, gps.lat, gps.lon);
-    if (dist > 25) {
-      ses.leftStartZone = true;
-    } else if (dist < 15 && ses.leftStartZone && lastSampleTs - ses.lapStartTime > 10000) {
-      await saveCompletedLap(ses, lastSampleTs, env);
-      ses.lapNumber += 1;
-      ses.lapStartTime = lastSampleTs;
-      ses.leftStartZone = false;
-      ses.lapMaxSpeed = 0;
-      ses.lapSpeedSum = 0;
-      ses.lapPointCount = 0;
-      ses.lapMaxGLat = 0;
-      ses.lapMaxGBrake = 0;
+  for (const point of rows) {
+    if (point.ts === lastTs) continue;
+    lastTs = point.ts;
+    let crossed = false;
+    if (point.lat || point.lon) {
+      start ??= point;
+      if (previousFix) {
+        const distance = haversineMeters(previousFix.lat, previousFix.lon, point.lat, point.lon);
+        if (distance > 0) {
+          const seconds = Math.min(2.5, (point.ts - previousFix.ts) / 1000);
+          const maxSpeedMps = Math.max(point.speed_kmh, previousFix.speed_kmh) / 3.6;
+          const continuous = point.ts - lastValidTs <= 2500 &&
+            distance <= 15 + Math.max(12, 1.5 * maxSpeedMps) * Math.max(1, seconds);
+          if (continuous) {
+            traveled += distance;
+            crossed = leftStart && traveled >= 75 && point.ts - lapStart >= MIN_LAP_MS &&
+              passesStart(start, previousFix, point, distance);
+            if (haversineMeters(start.lat, start.lon, point.lat, point.lon) >= LAP_EXIT_METERS) {
+              leftStart = true;
+            }
+          }
+          previousFix = point;
+        }
+      } else {
+        previousFix = point;
+      }
+      lastValidTs = point.ts;
+    }
+
+    points.push({
+      lap_id: lapId,
+      lap_number: lapNumber,
+      lap_offset_ms: point.ts - lapStart,
+      session_offset_ms: point.ts - sessionStart,
+      lat: point.lat,
+      lon: point.lon,
+      bearing: point.bearing,
+      speed_kmh: point.speed_kmh,
+      g_lat: point.g_lat,
+      g_lon: point.g_lon,
+      is_corner_apex: point.is_corner_apex,
+    });
+    count++;
+    sumSpeed += point.speed_kmh;
+    maxSpeed = Math.max(maxSpeed, point.speed_kmh);
+    maxLat = Math.max(maxLat, point.abs_g_lat);
+    maxBrake = Math.max(maxBrake, point.g_brake);
+
+    if (crossed) {
+      finishLap(true);
+      lapNumber++;
+      lapId = lapIdFor(sessionId, lapNumber);
+      lapStart = point.ts;
+      count = sumSpeed = maxSpeed = maxLat = maxBrake = traveled = 0;
+      leftStart = false;
     }
   }
-
-  // Flush în D1 la fiecare 20 de puncte
-  if (ses.pointsBuffer.length >= 20) {
-    await flushPointsToD1(ses, env);
-  }
+  if (count) finishLap(false);
+  return { laps, points };
 }
 
-async function flushPointsToD1(ses, env) {
-  if (ses.pointsBuffer.length === 0) return;
-  const toInsert = [...ses.pointsBuffer];
-  ses.pointsBuffer = [];
+// The cache is optional. The indexed cursor also sees batches committed late
+// with earlier source timestamps, so every rebuild produces the same projection.
+const sessionCache = new Map();
 
-  const stmt = env.DB.prepare(
-    "INSERT INTO telemetry_points (lap_id, lap_offset_ms, lat, lon, speed_kmh, bearing, g_lat, g_lon, is_corner_apex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  );
-  const updateSes = env.DB.prepare(
-    "UPDATE sessions SET updated_at = ? WHERE session_id = ?"
-  ).bind(new Date().toISOString(), ses.sessionId);
-
-  await env.DB.batch([
-    ...toInsert.map((p) =>
-      stmt.bind(p.lap_id, p.lap_offset_ms, p.lat, p.lon, p.speed_kmh, p.bearing, p.g_lat, p.g_lon, p.is_corner_apex)
-    ),
-    updateSes,
+async function readSessionTelemetry(sessionId, env) {
+  const cached = sessionCache.get(sessionId);
+  const [recent, stop] = await env.DB.batch([
+    env.DB.prepare(
+      "SELECT id, end_ts, lat, lon, speed, bearing, slices FROM telemetry_batches WHERE session_id = ? AND id > ? ORDER BY id"
+    ).bind(sessionId, cached?.cursor ?? 0),
+    env.DB.prepare("SELECT stop_ts FROM telemetry_stops WHERE session_id = ?").bind(sessionId),
   ]);
+  const stopTs = stop.results[0]?.stop_ts ?? Infinity;
+  if (!recent.results.length && cached?.stopTs === stopTs) return cached.telemetry;
+  const batches = [...(cached?.batches ?? []), ...recent.results];
+  if (!batches.length) return null;
+
+  batches.sort((a, b) => a.end_ts - b.end_ts);
+  const cursor = recent.results.at(-1)?.id ?? cached?.cursor;
+  const telemetry = buildSessionTelemetry(sessionId, batches, stopTs);
+
+  if (batches.length <= 5000 && cursor >= (sessionCache.get(sessionId)?.cursor ?? 0)) {
+    sessionCache.delete(sessionId);
+    sessionCache.set(sessionId, { batches, cursor, stopTs, telemetry });
+    if (sessionCache.size > 4) sessionCache.delete(sessionCache.keys().next().value);
+  }
+  return telemetry;
 }
 
+const legacyLapPrefix = (sessionId) => `${sessionId}_lap_`;
+const LEGACY_LAP_NUMBER = "COALESCE(l.lap_number, CAST(substr(tp.lap_id, length(?) + 1) AS INTEGER))";
 async function saveCompletedLap(ses, endTs, env) {
   await flushPointsToD1(ses, env);
   const lapId = `${ses.sessionId}_lap_${String(ses.lapNumber).padStart(2, "0")}`;
@@ -367,15 +384,35 @@ export default {
       }
     }
 
-    // ── REST API pentru Dashboard (GET-uri din D1) ──
-
     if (url.pathname === "/api/sessions" || url.pathname === "/sessions") {
       const { results } = await env.DB.prepare(
-        "SELECT session_id, device_id, track_name, created_at, COALESCE(updated_at, created_at) as updated_at FROM sessions ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50"
+        `SELECT s.session_id, s.device_id, s.track_name, s.created_at,
+                COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts,
+                (SELECT MAX(tb.id) FROM telemetry_batches tb WHERE tb.session_id = s.session_id) AS telemetry_revision
+         FROM sessions s LEFT JOIN telemetry_stops st USING (session_id)
+         ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 50`
       ).all();
       return Response.json(results, { headers: corsHeaders });
     }
 
+    const sessionMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/(laps|telemetry|live)$/);
+    if (sessionMatch) {
+      const sessionId = decodeURIComponent(sessionMatch[2]);
+      const action = sessionMatch[3];
+      const prefix = legacyLapPrefix(sessionId);
+      const end = prefix + "\uffff";
+      const lastMs = Math.min(60_000, Math.max(1, Number(url.searchParams.get("last_ms")) || 2000));
+
+      if (action === "live") {
+        const { results } = await env.DB.prepare(
+          `SELECT COALESCE(s.updated_at, s.created_at) AS updated_at, st.stop_ts
+           FROM sessions s LEFT JOIN telemetry_stops st USING (session_id) WHERE s.session_id = ?`
+        ).bind(sessionId).all();
+        const session = results[0];
+        if (!session || session.stop_ts != null || !(Date.now() - Date.parse(session.updated_at) <= 12_000)) {
+          return Response.json([], { headers: { ...corsHeaders, "X-Session-Status": "offline" } });
+        }
+      }
     const lapsMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/laps$/);
     if (lapsMatch) {
       const sessionId = decodeURIComponent(lapsMatch[2]);
@@ -434,84 +471,89 @@ export default {
       return Response.json(results, { headers: corsHeaders });
     }
 
-    // ── LIVE POLLING: ultimele N milisecunde de telemetrie pentru animație fluidă ──
-    // GET /api/sessions/:id/live?last_ms=2000
-    const liveMatch = url.pathname.match(/^(\/api)?\/sessions\/([^/]+)\/live$/);
-    if (liveMatch) {
-      const sessionId = decodeURIComponent(liveMatch[2]);
-      const lastMs = parseInt(url.searchParams.get("last_ms") || "2000", 10);
-
-      // Verificăm dacă sesiunea a avut activitate reală în ultimele 12 secunde
-      const { results: sesResults } = await env.DB.prepare(
-        "SELECT updated_at, created_at FROM sessions WHERE session_id = ?"
-      )
-        .bind(sessionId)
-        .all();
-
-      const ses = sesResults?.[0];
-      const lastUpdateStr = ses?.updated_at || ses?.created_at;
-      const lastUpdateMs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0;
-      const secondsAgo = (Date.now() - lastUpdateMs) / 1000;
-
-      // Dacă nu a trimis date în ultimele 12 secunde, sesiunea NU este live!
-      if (!lastUpdateMs || secondsAgo > 12) {
-        return Response.json([], {
-          headers: {
-            ...corsHeaders,
-            "X-Session-Status": "offline",
-            "X-Seconds-Ago": String(Math.round(secondsAgo)),
-          },
-        });
+      const recorded = await readSessionTelemetry(sessionId, env);
+      if (recorded) {
+        if (action === "laps") return Response.json(recorded.laps, { headers: corsHeaders });
+        if (action === "telemetry") return Response.json(recorded.points, { headers: corsHeaders });
+        const last = recorded.points.at(-1)?.session_offset_ms;
+        return Response.json(
+          recorded.points.filter((point) => point.session_offset_ms >= last - lastMs),
+          { headers: corsHeaders }
+        );
       }
 
-      // Luăm cel mai recent lap_offset_ms din sesiune
-      const { results: latest } = await env.DB.prepare(
-        `SELECT tp.lap_offset_ms
-         FROM telemetry_points tp
-         LEFT JOIN laps l ON tp.lap_id = l.lap_id
-         WHERE l.session_id = ? OR tp.lap_id LIKE ?
-         ORDER BY tp.id DESC
-         LIMIT 1`
-      )
-        .bind(sessionId, `${sessionId}%`)
-        .all();
-
-      if (!latest || latest.length === 0) {
-        return Response.json([], { headers: corsHeaders });
+      // Historical rows do not have source timestamps. Keep their original
+      // lap IDs and expose partial traces even when there is no summary row.
+      if (action === "laps") {
+        const { results } = await env.DB.prepare(
+          `SELECT l.lap_id, l.session_id, l.lap_number, l.duration_ms,
+                  l.max_speed_kmh, l.avg_speed_kmh, l.max_g_lat, l.max_g_brake,
+                  NULL AS is_complete, NULL AS is_valid FROM laps l WHERE l.session_id = ?
+           UNION ALL
+           SELECT tp.lap_id, ?, ${LEGACY_LAP_NUMBER}, MAX(tp.lap_offset_ms),
+                  COALESCE(MAX(tp.speed_kmh), 0), COALESCE(ROUND(AVG(tp.speed_kmh), 1), 0),
+                  COALESCE(ROUND(MAX(ABS(tp.g_lat)), 2), 0),
+                  COALESCE(ROUND(MAX(0, -MIN(tp.g_lon)), 2), 0), 0, 0
+           FROM telemetry_points tp LEFT JOIN laps l ON tp.lap_id = l.lap_id
+           WHERE l.lap_id IS NULL AND tp.lap_id >= ? AND tp.lap_id < ?
+           GROUP BY tp.lap_id
+           ORDER BY lap_number`
+        ).bind(sessionId, sessionId, prefix, prefix, end).all();
+        return Response.json(results, { headers: corsHeaders });
       }
 
-      const maxOffset = latest[0].lap_offset_ms;
-      const minOffset = Math.max(0, maxOffset - lastMs);
+      if (action === "live") {
+        const { results } = await env.DB.prepare(
+          `SELECT tp.lap_id, tp.lap_offset_ms FROM telemetry_points tp
+           LEFT JOIN laps l ON tp.lap_id = l.lap_id
+           WHERE l.session_id = ? OR (tp.lap_id >= ? AND tp.lap_id < ?)
+           ORDER BY tp.id DESC LIMIT 1`
+        ).bind(sessionId, prefix, end).all();
+        const latest = results[0];
+        if (!latest) return Response.json([], { headers: corsHeaders });
+        const { results: points } = await env.DB.prepare(
+          `SELECT tp.*, ${LEGACY_LAP_NUMBER} AS lap_number FROM telemetry_points tp
+           LEFT JOIN laps l ON tp.lap_id = l.lap_id
+           WHERE tp.lap_id = ? AND tp.lap_offset_ms BETWEEN ? AND ?
+           ORDER BY tp.lap_offset_ms, tp.id`
+        ).bind(prefix, latest.lap_id, latest.lap_offset_ms - lastMs, latest.lap_offset_ms).all();
+        return Response.json(points, { headers: corsHeaders });
+      }
 
-      // Returnăm toate punctele din fereastra de timp cerută
       const { results } = await env.DB.prepare(
-        `SELECT tp.*, COALESCE(l.lap_number, 1) as lap_number
-         FROM telemetry_points tp
-         LEFT JOIN laps l ON tp.lap_id = l.lap_id
-         WHERE (l.session_id = ? OR tp.lap_id LIKE ?)
-           AND tp.lap_offset_ms >= ?
-           AND tp.lap_offset_ms <= ?
-         ORDER BY tp.lap_offset_ms ASC`
-      )
-        .bind(sessionId, `${sessionId}%`, minOffset, maxOffset)
-        .all();
+        `SELECT tp.*, ${LEGACY_LAP_NUMBER} AS lap_number
+         FROM telemetry_points tp LEFT JOIN laps l ON tp.lap_id = l.lap_id
+         WHERE l.session_id = ? OR (tp.lap_id >= ? AND tp.lap_id < ?)
+         ORDER BY lap_number, tp.lap_offset_ms, tp.id`
+      ).bind(prefix, sessionId, prefix, end).all();
+      return Response.json(results, { headers: corsHeaders });
+    }
 
+    const lapMatch = url.pathname.match(/^(\/api)?\/laps\/([^/]+)\/telemetry$/);
+    if (lapMatch) {
+      const lapId = decodeURIComponent(lapMatch[2]);
+      const sessionId = /^(.*)_lap_\d+$/.exec(lapId)?.[1];
+      if (sessionId) {
+        const recorded = await readSessionTelemetry(sessionId, env);
+        if (recorded) {
+          return Response.json(recorded.points.filter((point) => point.lap_id === lapId), { headers: corsHeaders });
+        }
+      }
+      const { results } = await env.DB.prepare(
+        `SELECT tp.*, ${LEGACY_LAP_NUMBER} AS lap_number
+         FROM telemetry_points tp LEFT JOIN laps l ON tp.lap_id = l.lap_id
+         WHERE tp.lap_id = ? ORDER BY tp.lap_offset_ms, tp.id`
+      ).bind(legacyLapPrefix(sessionId ?? ""), lapId).all();
       return Response.json(results, { headers: corsHeaders });
     }
 
     return new Response("F1 Telemetry API Online — Queue Architecture", { headers: corsHeaders });
   },
 
-  // ── CONSUMER: Preia mesajele din Cloudflare Queue și execută calculele + scrie în D1 ──
+  // Persist the queue batch atomically before acknowledging its messages.
   async queue(batch, env) {
-    for (const message of batch.messages) {
-      try {
-        await processBatchConsumer(message.body, env);
-        message.ack(); // Confirmăm procesarea: Cloudflare șterge mesajul din coadă
-      } catch (err) {
-        console.error("Queue consumer error:", err);
-        message.retry(); // Dacă a eșuat, Cloudflare reîncercă automat mesajul
-      }
-    }
+    const statements = batch.messages.flatMap((message) => storeMessage(message.body, env));
+    if (statements.length) await env.DB.batch(statements);
+    batch.ackAll();
   },
 };

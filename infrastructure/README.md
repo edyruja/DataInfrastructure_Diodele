@@ -50,6 +50,8 @@ DATABASE_NAME=$(terraform -chdir=infrastructure output -raw database_name)
 
 ## Planificare și aplicare
 
+Pentru o bază D1 existentă, reaplică `src/backend/schema.sql` înainte de actualizarea Workerului de telemetrie. Comanda `wrangler d1 execute` din secțiunea anterioară creează tabelele pentru loturile cu timestamp și opririle de sesiune. Sesiunile din schema veche pot fi consultate în dashboard. Publică Workerul între sesiuni pentru ca o înregistrare să folosească aceeași schemă de la început până la final.
+
 ```bash
 terraform -chdir=infrastructure plan
 terraform -chdir=infrastructure apply

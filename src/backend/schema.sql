@@ -31,3 +31,22 @@ CREATE TABLE IF NOT EXISTS telemetry_points (
 );
 
 CREATE INDEX IF NOT EXISTS idx_lap_time ON telemetry_points(lap_id, lap_offset_ms);
+
+CREATE TABLE IF NOT EXISTS telemetry_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  end_ts INTEGER NOT NULL,
+  lat REAL NOT NULL,
+  lon REAL NOT NULL,
+  speed REAL NOT NULL,
+  bearing REAL NOT NULL,
+  slices TEXT NOT NULL,
+  UNIQUE (session_id, end_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telemetry_batch_cursor ON telemetry_batches(session_id, id);
+
+CREATE TABLE IF NOT EXISTS telemetry_stops (
+  session_id TEXT PRIMARY KEY,
+  stop_ts INTEGER NOT NULL
+);

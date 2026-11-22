@@ -23,6 +23,8 @@ export type ApiSession = {
   track_name: string;
   created_at: string;
   updated_at?: string;
+  stop_ts?: number | null;
+  telemetry_revision?: number | null;
 };
 
 export type ApiLap = {
@@ -33,13 +35,15 @@ export type ApiLap = {
   avg_speed_kmh: number;
   max_g_lat: number;
   max_g_brake: number;
-  is_valid?: boolean | number;
+  is_valid?: boolean | number | null;
+  is_complete?: boolean | number | null;
 };
 
 export type TelemetryPoint = {
   lap_id: string;
   lap_number: number;
   lap_offset_ms: number;
+  session_offset_ms?: number;
   lat: number;
   lon: number;
   speed_kmh: number;
@@ -182,54 +186,47 @@ export function formatDelta(ms: number): string {
   return `${sign}${secs}.${String(millis).padStart(3, "0")}s`;
 }
 
-/**
- * Evaluates whether a lap is complete and valid.
- * An incomplete or aborted lap (e.g. session stopped prematurely after a few seconds)
- * is considered invalid and must not be selected as the best lap nor shown in "Valid only".
- */
 export function isLapValid(
   lap: ApiLap,
-  allLaps?: ApiLap[],
+  _allLaps?: ApiLap[],
   telemetryPoints?: TelemetryPoint[],
 ): boolean {
-  // 1. Explicit invalid flag from backend if present
-  if (lap.is_valid === false || (lap as any).is_valid === 0) {
+  if (lap.is_complete === false || lap.is_complete === 0 || lap.is_valid === false || lap.is_valid === 0) {
     return false;
   }
+  if (lap.is_complete === true || lap.is_complete === 1) return true;
+  if (lap.duration_ms < 15000) return false;
 
-  // 2. Minimum duration requirement:
-  // Any real circuit lap requires at least 15 seconds (15,000 ms).
-  if (!lap.duration_ms || lap.duration_ms < 15000) {
-    return false;
-  }
+  // Older data only records an inferred lap ID and a local offset.
+  const points = telemetryPoints?.filter((point) => point.lap_id === lap.lap_id) ?? [];
+  if (points.length === 0) return true;
+  if (points.length < 25 || points.at(-1)!.lap_offset_ms > lap.duration_ms + 1000) return false;
 
-  // 3. Telemetry point count check if telemetry is loaded
-  if (telemetryPoints && telemetryPoints.length > 0) {
-    const lapPts = telemetryPoints.filter(
-      (p) => p.lap_id === lap.lap_id || p.lap_number === lap.lap_number,
-    );
-    // If telemetry is present for the session and this lap has fewer than 25 points (~1-2 seconds), it's incomplete
-    if (lapPts.length > 0 && lapPts.length < 25) {
-      return false;
+  const fixes = points.filter(hasGpsFix);
+  if (fixes.length < 2) return false;
+  const first = fixes[0]!;
+  const last = fixes.at(-1)!;
+  if (haversineMeters(first.lat, first.lon, last.lat, last.lon) > 35) return false;
+
+  return !fixes.some((point, i) => {
+    const previous = fixes[i - 1];
+    return previous && isGpsJump(previous, point);
+  });
+}
+
+/** Use the source clock when available. Legacy sessions only have lap-relative offsets. */
+export function buildReplayTimeline(points: TelemetryPoint[]): TelemetryPoint[] {
+  let lapId: string | undefined;
+  let lapStart = 0;
+  let lastTime = -1;
+  return points.map((point) => {
+    if (lapId !== point.lap_id) {
+      lapStart = lastTime + 1;
+      lapId = point.lap_id;
     }
-  }
-
-  // 4. Relative duration check vs other laps in the session:
-  // An aborted/incomplete lap will be less than 50% of the fastest candidate lap.
-  if (allLaps && allLaps.length > 1) {
-    const candidateDurations = allLaps
-      .filter((l) => l.duration_ms && l.duration_ms >= 15000)
-      .map((l) => l.duration_ms);
-
-    if (candidateDurations.length > 0) {
-      const minDuration = Math.min(...candidateDurations);
-      if (lap.duration_ms < minDuration * 0.5) {
-        return false;
-      }
-    }
-  }
-
-  return true;
+    lastTime = point.session_offset_ms ?? lapStart + point.lap_offset_ms;
+    return { ...point, lap_offset_ms: lastTime };
+  });
 }
 
 /** Map speed to a colour: green (fast) → yellow → red (slow/braking) */
@@ -264,6 +261,7 @@ export type Projected = {
   lat?: number | undefined;
   lon?: number | undefined;
   timeMs?: number | undefined;
+  breakBefore?: boolean | undefined;
 };
 
 export type TrackBounds = {
@@ -292,11 +290,22 @@ export function haversineMeters(
   return R * c;
 }
 
+export function hasGpsFix(point: { lat: number; lon: number }): boolean {
+  return Number.isFinite(point.lat) && Math.abs(point.lat) <= 90 &&
+    Number.isFinite(point.lon) && Math.abs(point.lon) <= 180 && (point.lat !== 0 || point.lon !== 0);
+}
+
+function isGpsJump(a: TelemetryPoint, b: TelemetryPoint): boolean {
+  const seconds = Math.max(1, (b.lap_offset_ms - a.lap_offset_ms) / 1000);
+  const speed = Math.max(10, a.speed_kmh / 3.6, b.speed_kmh / 3.6);
+  return haversineMeters(a.lat, a.lon, b.lat, b.lon) > 18 + 1.5 * speed * seconds;
+}
+
 export function computeTrackBounds(
   points: Array<{ lat: number; lon: number }>,
   minSpanMeters = 60,
 ): TrackBounds | null {
-  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
+  const valid = points.filter(hasGpsFix);
   if (valid.length === 0) return null;
 
   const first = valid[0]!;
@@ -369,13 +378,14 @@ export function projectPoints(
     g_lon?: number;
     timeMs?: number;
     lap_offset_ms?: number;
+    breakBefore?: boolean | undefined;
   }>,
   w = 400,
   h = 220,
   pad = 24,
   boundsOverride?: TrackBounds | null,
 ): Projected[] {
-  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
+  const valid = points.filter(hasGpsFix);
   if (!valid.length) return [];
 
   const bounds = boundsOverride || computeTrackBounds(valid);
@@ -393,6 +403,7 @@ export function projectPoints(
       lat: p.lat,
       lon: p.lon,
       timeMs: p.timeMs ?? p.lap_offset_ms,
+      breakBefore: p.breakBefore,
     };
   });
 }
@@ -408,6 +419,19 @@ export function interpolateTrackSpline(
   pointsPerSegment = 4,
 ): Projected[] {
   if (!points || points.length <= 2) return points ? [...points] : [];
+
+  if (points.some((point, index) => index > 0 && point.breakBefore)) {
+    const smoothed: Projected[] = [];
+    let start = 0;
+    for (let end = 1; end <= points.length; end++) {
+      if (end < points.length && !points[end]!.breakBefore) continue;
+      const segment = interpolateTrackSpline(points.slice(start, end), false, pointsPerSegment);
+      segment[0] = { ...segment[0]!, breakBefore: points[start]!.breakBefore };
+      for (const point of segment) smoothed.push(point);
+      start = end;
+    }
+    return smoothed;
+  }
 
   const n = points.length;
   const result: Projected[] = [];
@@ -469,8 +493,8 @@ export function interpolateTrackSpline(
           : undefined;
 
       result.push({
-        x: Number(x.toFixed(1)),
-        y: Number(y.toFixed(1)),
+        x: Number(Math.max(Math.min(p1.x, p2.x), Math.min(x, Math.max(p1.x, p2.x))).toFixed(1)),
+        y: Number(Math.max(Math.min(p1.y, p2.y), Math.min(y, Math.max(p1.y, p2.y))).toFixed(1)),
         speed: Number(speed.toFixed(1)),
         apex: t > 0.5 ? p2.apex : p1.apex,
         g_lat: g_lat !== undefined ? Number(g_lat.toFixed(2)) : undefined,
@@ -569,6 +593,10 @@ export function interpolateTelemetryPoint(
   const p1 = points[nextIdx]!;
 
   const span = p1.lap_offset_ms - p0.lap_offset_ms;
+  if (timeMs > p0.lap_offset_ms && (
+    p0.lap_id !== p1.lap_id || span > 2500 ||
+    (hasGpsFix(p0) && hasGpsFix(p1) && isGpsJump(p0, p1))
+  )) return null;
   const rawAlpha = span > 0 ? (timeMs - p0.lap_offset_ms) / span : 0;
   const alpha = Math.max(0, Math.min(1, rawAlpha));
 
@@ -597,52 +625,43 @@ export type GpsWaypoint = {
   speed_kmh: number;
   g_lat: number;
   g_lon: number;
+  breakBefore?: boolean;
 };
 
-/**
- * Extracts clean, distinct GPS waypoints from telemetry points.
- * Eliminates duplicate/frozen GPS coordinates caused by sensor chunking,
- * ensuring continuous 60 FPS interpolation without pauses or teleportation.
- */
+/** Keep measured GPS fixes and flag gaps before projection or smoothing. */
 export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
-  const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
-  if (!valid.length) return [];
-
   const waypoints: GpsWaypoint[] = [];
+  let previous: TelemetryPoint | undefined;
+  let missingFix = false;
 
-  for (let i = 0; i < valid.length; i++) {
-    const p = valid[i]!;
-    if (waypoints.length === 0) {
-      waypoints.push({
-        timeMs: p.lap_offset_ms,
-        lat: p.lat,
-        lon: p.lon,
-        speed_kmh: p.speed_kmh,
-        g_lat: p.g_lat,
-        g_lon: p.g_lon,
-      });
+  for (const point of points) {
+    if (!hasGpsFix(point)) {
+      missingFix = true;
       continue;
     }
 
-    const last = waypoints[waypoints.length - 1]!;
-    const dist = haversineMeters(last.lat, last.lon, p.lat, p.lon);
-    const dt = p.lap_offset_ms - last.timeMs;
+    const last = waypoints.at(-1);
+    const timeMs = point.lap_offset_ms;
+    if (last && timeMs <= last.timeMs) continue;
+    const distance = last ? haversineMeters(last.lat, last.lon, point.lat, point.lon) : 0;
+    const breakBefore = previous && (previous.lap_id !== point.lap_id || missingFix ||
+      timeMs - previous.lap_offset_ms > 2500 || isGpsJump(previous, point));
 
-    // Record as new waypoint if vehicle moved (>= 0.6m) or stationary interval passed (> 400ms)
-    // or if it's the very last point
-    if (dist >= 0.6 || (p.speed_kmh === 0 && dt > 400) || i === valid.length - 1) {
-      const timeMs = dt > 0 ? p.lap_offset_ms : last.timeMs + 10;
+    if (!last || breakBefore || distance >= 0.6 ||
+      (timeMs - last.timeMs >= 400 && point.speed_kmh < 2) || point === points.at(-1)) {
       waypoints.push({
         timeMs,
-        lat: p.lat,
-        lon: p.lon,
-        speed_kmh: p.speed_kmh,
-        g_lat: p.g_lat,
-        g_lon: p.g_lon,
+        lat: point.lat,
+        lon: point.lon,
+        speed_kmh: point.speed_kmh,
+        g_lat: point.g_lat,
+        g_lon: point.g_lon,
+        ...(breakBefore ? { breakBefore: true } : {}),
       });
     }
+    previous = point;
+    missingFix = false;
   }
-
   return waypoints;
 }
 
@@ -694,6 +713,8 @@ export function interpolateTrackPosition(
   const w0 = waypoints[idx]!;
   const w1 = waypoints[idx + 1]!;
 
+  if (w1.breakBefore && timeMs > w0.timeMs) return null;
+
   const span = w1.timeMs - w0.timeMs;
   const alpha = span > 0 ? Math.max(0, Math.min(1, (timeMs - w0.timeMs) / span)) : 0;
 
@@ -713,7 +734,7 @@ export function interpolateTrackPosition(
  */
 export function snapPointToPolyline(
   p: { x: number; y: number },
-  polyline: Array<{ x: number; y: number }>,
+  polyline: Array<{ x: number; y: number; breakBefore?: boolean | undefined }>,
   maxCorridorPx = 45,
 ): { x: number; y: number; distance: number; segmentIndex: number } {
   if (polyline.length === 0) return { x: p.x, y: p.y, distance: 0, segmentIndex: 0 };
@@ -728,6 +749,7 @@ export function snapPointToPolyline(
   for (let i = 0; i < polyline.length - 1; i++) {
     const a = polyline[i]!;
     const b = polyline[i + 1]!;
+    if (b.breakBefore) continue;
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const lenSq = dx * dx + dy * dy;
@@ -745,6 +767,7 @@ export function snapPointToPolyline(
   }
 
   const distance = Math.sqrt(best.distSq);
+  if (!Number.isFinite(distance)) return { ...p, distance: 0, segmentIndex: 0 };
 
   if (distance <= maxCorridorPx) {
     return { x: best.x, y: best.y, distance, segmentIndex: best.segmentIndex };
