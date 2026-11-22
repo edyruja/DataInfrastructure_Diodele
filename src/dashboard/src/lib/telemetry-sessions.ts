@@ -604,7 +604,7 @@ export type GpsWaypoint = {
  * Eliminates duplicate/frozen GPS coordinates caused by sensor chunking,
  * ensuring continuous 60 FPS interpolation without pauses or teleportation.
  */
-export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
+export function extractGpsWaypoints(points: TelemetryPoint[], maxJumpMeters = 10): GpsWaypoint[] {
   const valid = points.filter((p) => p.lat !== 0 && p.lon !== 0);
   if (!valid.length) return [];
 
@@ -627,6 +627,12 @@ export function extractGpsWaypoints(points: TelemetryPoint[]): GpsWaypoint[] {
     const last = waypoints[waypoints.length - 1]!;
     const dist = haversineMeters(last.lat, last.lon, p.lat, p.lon);
     const dt = p.lap_offset_ms - last.timeMs;
+
+    // Ignoră salturile parazite mai mari de maxJumpMeters (ex: 10m)
+    // pentru a preveni liniile drepte care taie interiorul circuitului din cauza pachetelor defazate/duplicate
+    if (dist > maxJumpMeters && i < valid.length - 1) {
+      continue;
+    }
 
     // Record as new waypoint if vehicle moved (>= 0.6m) or stationary interval passed (> 400ms)
     // or if it's the very last point
