@@ -611,9 +611,8 @@ function Index() {
   }, [activeTrackPoints, laps.length]);
 
   // Track GPS waypoints: deduplicates consecutive stationary points for continuous 60 FPS trajectory
-  // Filtrează salturile parazite > 10m pentru a elimina liniile drepte accidentale
   const trackWaypoints = useMemo(() => {
-    return extractGpsWaypoints(activeTrackPoints, 10);
+    return extractGpsWaypoints(activeTrackPoints);
   }, [activeTrackPoints]);
 
   // Track bounding box (smooth auto-expansion during Lap 1, locked on Lap 2+)
