@@ -49,6 +49,87 @@ async function get(worker, env, path) {
   return result.json();
 }
 
+function post(worker, env, data) {
+  return worker.fetch(new Request("https://example.test/api/telemetry", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  }), env);
+}
+
+test("a phone batch initializes D1 and goes live without a queue consumer", async (t) => {
+  const { db, env } = createDatabase(t);
+  const { default: worker } = await import(workerModule + "#phone");
+  db.exec("DROP TABLE telemetry_stops;");
+  // The phone's clock can differ from the Worker's clock.
+  const phoneTime = Date.now() - 3_600_000;
+  const sessionId = `ses_${phoneTime}`;
+  const sessionPath = `/sessions/${sessionId}`;
+  const batch = {
+    session_id: sessionId,
+    device_id: "Phone",
+    track_name: "Test circuit",
+    event_type: "telemetry_batch",
+    gps: { lat: 44, lon: 26, speed: 10, bearing: 0 },
+    samples: [{ ts: phoneTime + 50 }, { ts: phoneTime + 100 }],
+  };
+
+  const result = await post(worker, env, batch);
+  assert.equal(result.status, 202);
+  assert.deepEqual(await result.json(), { status: "stored" });
+  const [session] = await get(worker, env, "/sessions");
+  assert.equal(session.session_id, sessionId);
+  assert.equal(session.created_at, new Date(phoneTime).toISOString());
+  assert(Date.now() - Date.parse(session.updated_at) < 5000);
+  assert(session.telemetry_revision > 0);
+  assert.deepEqual(
+    (await get(worker, env, sessionPath + "/live")).map((point) => point.session_offset_ms),
+    [50, 100],
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM telemetry_batches").get().count, 1);
+
+  const oldActivity = new Date(Date.now() - 60_000).toISOString();
+  db.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").run(oldActivity, sessionId);
+  assert.equal((await post(worker, env, batch)).status, 202);
+  assert.equal((await get(worker, env, "/sessions"))[0].updated_at, oldActivity);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM telemetry_batches").get().count, 1);
+
+  const stop = {
+    session_id: sessionId,
+    event_type: "STOP_SESSION",
+    timestamp: new Date(phoneTime + 200).toISOString(),
+  };
+  assert.equal((await post(worker, env, stop)).status, 202);
+  const [finished] = await get(worker, env, "/sessions");
+  assert.equal(finished.stop_ts, phoneTime + 200);
+  assert.deepEqual(await get(worker, env, sessionPath + "/live"), []);
+  assert.equal((await get(worker, env, sessionPath + "/telemetry")).length, 2);
+});
+
+test("the phone receives a retryable error when D1 fails even if the queue accepts the batch", async (t) => {
+  const { env } = createDatabase(t);
+  const { default: worker } = await import(workerModule + "#retry");
+  const pending = [];
+  env.TELEMETRY_QUEUE = { async send(batch) { pending.push(batch); } };
+  const write = env.DB.batch;
+  env.DB.batch = async () => { throw Error("Temporary database failure"); };
+  t.mock.method(console, "error", () => {});
+  const batch = {
+    session_id: "phone-retry",
+    event_type: "telemetry_batch",
+    samples: [{ ts: Date.now() }],
+  };
+
+  assert.equal((await post(worker, env, batch)).status, 503);
+  assert.deepEqual(pending, [batch]);
+  assert.equal((await post(worker, env, { ...batch, samples: [] })).status, 400);
+  assert.deepEqual(pending, [batch]);
+
+  env.DB.batch = write;
+  await deliver(worker, env, pending);
+  assert.equal((await get(worker, env, "/sessions/phone-retry/live")).length, 1);
+});
+
 test("two Workers agree on lap boundaries after retries, reverse ordering and an early stop delivery", async (t) => {
   const { db, env } = createDatabase(t);
   const { default: writer } = await import(workerModule + "#writer");

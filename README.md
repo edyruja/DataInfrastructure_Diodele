@@ -9,27 +9,14 @@
 Acest proiect reprezintă o infrastructură completă de telemetrie auto de înaltă performanță, concepută pentru mediul de motorsport. Soluția elimină necesitatea echipamentelor hardware costisitoare prin transformarea unui smartphone într-o unitate de telemetrie capabilă să captureze forțe G la 50 Hz și poziție satelitară de înaltă precizie.
 
 ### Arhitectura Sistemului (Pipeline-ul de Date)
-Arhitectura este complet decuplată și distribuită la Edge pe Cloudflare:
+Telefonul primește confirmarea după salvarea lotului în D1.
 
 ```
-[ Smartphone / Pilot ]
-        │  (50 Hz IMU + GPS satelit, batching 1s)
-        ▼
-[ Cloudflare Worker (Producer) ] ── (ACK instant 15ms) ──► [ Smartphone ]
-        │
-        ▼ (Asincron)
-[ Cloudflare Queues (telemetry-queue) ]
-        │
-        ▼ (Loturi de până la 50 mesaje)
-[ Cloudflare Worker (Consumer) ]
-        ├── Fuziune Senzorială (IMU + GPS)
-        ├── Calcul Dinamic Forțe G & Aderență combinată
-        ├── Geo-fencing Haversine (< 15m) & Lap Auto-Split
-        ▼
-[ Cloudflare D1 (Serverless SQLite) ]
-        ▲
-        │ (Near Real-Time Polling 1s)
-[ TanStack Start Dashboard (React 19) ] ──► Cockpit 911 GT2 RS (60 FPS)
+[ Smartphone ] ──► [ Cloudflare Worker ] ──► [ D1 ]
+                           │                   ▲
+                           └─ reîncercare ─► [ Cloudflare Queue ]
+
+[ D1 ] ──► [ Worker · forțe G și tururi ] ──► [ Dashboard ]
 ```
 
 ---
@@ -40,7 +27,7 @@ Arhitectura este complet decuplată și distribuită la Edge pe Cloudflare:
 | :--- | :--- |
 | **Mobile Capture** | React Native, Expo SDK 58, Expo Sensors (Accelerometru, Giroscop), Expo Location (GPS) |
 | **Ingestion & Messaging** | Cloudflare Workers (Edge Serverless), Cloudflare Queues (Buffer asincron la nivel global) |
-| **Data Processing** | Worker Consumer (Fuziune IMU-GPS, Haversine Lap Detection, filtrare matematică) |
+| **Data Processing** | Worker (Fuziune IMU-GPS și detecția tururilor din loturile ordonate) |
 | **Storage & Persistence** | Cloudflare D1 (Bază relațională SQLite distribuită la Edge, indecși pe `lap_offset_ms`) |
 | **Digital Cockpit** | TanStack Start, React 19, Vite, Tailwind CSS, Lucide Icons, Catmull-Rom Spline Interpolation |
 | **Infrastructure as Code** | HashiCorp Terraform (Provider Cloudflare v5), Wrangler CLI |
@@ -117,7 +104,7 @@ Dacă doriți să faceți deploy manual al Worker-ului și aplicarea schemei baz
 cd src/backend
 
 # 1. Aplicare schemă SQL în D1
-npx wrangler d1 execute telemetry-db --remote --file=schema.sql
+npx wrangler d1 execute pero_diodele --remote --file=schema.sql
 
 # 2. Creare coadă (dacă nu a fost creată prin Terraform)
 npx wrangler queues create telemetry-queue
@@ -138,7 +125,7 @@ npx expo start
 
 ## 📊 6. Key Features
 
-- **Decuplare Totală**: Ingestia răspunde în sub 15ms grație Cloudflare Queues; scrierea în D1 se face în loturi (batch size 20-50).
+- **Confirmare la salvare**. Workerul confirmă lotul după scrierea în D1. Cloudflare Queues poate prelua reîncercările.
 - **Fuziune Senzorială IMU + GPS**: Decuplează forțele laterale și de frânare folosind viteza satelitară și giroscopul 3-axe, eliminând nevoia alinierii rigide a telefonului.
 - **Trigonometrie Haversine**: Închide și cronometrează automat tururile la traversarea liniei de start (< 15 metri).
 - **60 FPS Smooth Playback**: Dashboard-ul interpolează datele prin spline Catmull-Rom și dinamică de chunk-buffering pentru a elimina sacadarea.

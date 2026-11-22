@@ -1,6 +1,6 @@
 # Infrastructura Cloudflare
 
-Aplicația mobilă trimite datele la `POST /api/telemetry`. Worker-ul `datainfrastructure-diodele` le publică în coada `telemetry-queue` prin binding-ul `TELEMETRY_QUEUE`. Același Worker consumă loturi de până la 50 de mesaje, cu o așteptare de cel mult o secundă pentru formarea lotului, și salvează rezultatele în D1 prin binding-ul `DB`.
+Aplicația mobilă trimite datele la `POST /api/telemetry`. Workerul `datainfrastructure-diodele` răspunde cu HTTP 202 și `status: stored` după ce salvează lotul în D1 prin binding-ul `DB`. Dacă scrierea eșuează, răspunde cu HTTP 503 ca telefonul să reîncerce și încearcă să trimită lotul în `telemetry-queue` prin binding-ul `TELEMETRY_QUEUE`. Consumatorul salvează mesajele din coadă prin aceeași operație, care deduplică loturile.
 
 Dashboard-ul `datainfrastructure-diodele12` rulează ca Worker. Terraform publică modulele SSR din `src/dashboard/.output/server` și fișierele statice din `src/dashboard/.output/public` prin binding-ul `ASSETS`.
 
@@ -50,7 +50,7 @@ DATABASE_NAME=$(terraform -chdir=infrastructure output -raw database_name)
 
 ## Planificare și aplicare
 
-Pentru o bază D1 existentă, reaplică `src/backend/schema.sql` înainte de actualizarea Workerului de telemetrie. Comanda `wrangler d1 execute` din secțiunea anterioară creează tabelele pentru loturile cu timestamp și opririle de sesiune. Sesiunile din schema veche pot fi consultate în dashboard. Publică Workerul între sesiuni pentru ca o înregistrare să folosească aceeași schemă de la început până la final.
+Comanda `wrangler d1 execute` din secțiunea anterioară aplică schema completă. Într-o bază D1 existentă, Workerul poate crea și la prima scriere tabelele aditive `telemetry_batches` și `telemetry_stops` dacă lipsesc. Loturile noi pot fi verificate direct în `telemetry_batches`. Tabelul `telemetry_points` conține punctele înregistrate cu versiunea anterioară.
 
 ```bash
 terraform -chdir=infrastructure plan
