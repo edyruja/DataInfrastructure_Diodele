@@ -101,21 +101,34 @@ test("two Workers agree on lap boundaries after retries, reverse ordering and an
   assert.deepEqual((await get(otherWriter, env, path + "/laps")), laps);
 });
 
-test("legacy sessions retain their stored laps and expose unfinalized lap IDs", async (t) => {
+test("legacy sessions load before the additive D1 migration and retain access after it", async (t) => {
   const { db, env } = createDatabase(t);
   const { default: worker } = await import(workerModule + "#legacy");
+  db.exec("DROP TABLE telemetry_batches; DROP TABLE telemetry_stops;");
   db.exec(`
     INSERT INTO sessions (session_id, created_at, updated_at)
     VALUES ('ses_legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-    INSERT INTO laps VALUES ('ses_legacy_lap_01', 'ses_legacy', 1, 20000, 50, 40, 1, 1);
+    INSERT INTO laps VALUES ('ses_legacy_lap_01', 'ses_legacy', 1, 20000, 15, 10, 0, 0);
     INSERT INTO telemetry_points (lap_id, lap_offset_ms, lat, lon, speed_kmh, g_lat, g_lon)
     VALUES ('ses_legacy_lap_01', 20000, 44, 26, 50, 0.5, -0.2),
            ('ses_legacy_lap_04', 6000, 44, 26, 30, 0.3, -0.1),
            ('ses_legacy_other_lap_02', 1000, 44, 26, 40, 0.4, 0.2);
   `);
+  db.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = 'ses_legacy'").run(new Date().toISOString());
+  const sessions = await get(worker, env, "/sessions");
+  assert.equal(sessions[0].session_id, "ses_legacy");
+  assert.equal(sessions[0].telemetry_revision, null);
+  assert.equal(sessions[0].stop_ts, null);
   const laps = await get(worker, env, "/sessions/ses_legacy/laps");
   assert.deepEqual(laps.map((lap) => [lap.lap_number, lap.is_complete]), [[1, null], [4, 0]]);
+  const { max_speed_kmh, avg_speed_kmh, max_g_lat, max_g_brake } = laps[0];
+  assert.deepEqual([max_speed_kmh, avg_speed_kmh, max_g_lat, max_g_brake], [50, 50, 0.5, 0.2]);
   const points = await get(worker, env, "/sessions/ses_legacy/telemetry");
   assert.deepEqual(points.map((point) => point.lap_number), [1, 4]);
+  assert.equal((await get(worker, env, "/sessions/ses_legacy/live"))[0].lap_number, 4);
   assert.equal((await get(worker, env, "/laps/ses_legacy_lap_04/telemetry"))[0].lap_number, 4);
+
+  db.exec(schema);
+  assert.deepEqual(await get(worker, env, "/sessions"), sessions);
+  assert.deepEqual(await get(worker, env, "/sessions/ses_legacy/laps"), laps);
 });
