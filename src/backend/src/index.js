@@ -109,11 +109,17 @@ function storeMessage(data, env) {
       `INSERT INTO sessions (session_id, device_id, track_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          created_at = MIN(sessions.created_at, excluded.created_at),
-         updated_at = MAX(COALESCE(sessions.updated_at, sessions.created_at), excluded.updated_at)`
+         updated_at = CASE WHEN EXISTS (
+           SELECT 1 FROM telemetry_batches
+           WHERE session_id = excluded.session_id AND end_ts = ?
+         ) OR EXISTS (
+           SELECT 1 FROM telemetry_stops WHERE session_id = excluded.session_id
+         ) THEN sessions.updated_at
+         ELSE MAX(COALESCE(sessions.updated_at, sessions.created_at), excluded.updated_at) END`
     ).bind(sessionId,
       typeof data.device_id === "string" && data.device_id ? data.device_id : "S23-Driver",
       typeof data.track_name === "string" && data.track_name ? data.track_name : "Default-Track",
-      new Date(startTs).toISOString(), new Date(lastTs).toISOString()),
+      new Date(startTs).toISOString(), new Date().toISOString(), lastTs),
     env.DB.prepare(
       `INSERT INTO telemetry_batches (session_id, end_ts, lat, lon, speed, bearing, slices)
        VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, end_ts) DO NOTHING`
@@ -290,23 +296,65 @@ async function readSessionTelemetry(sessionId, env) {
 
 const legacyLapPrefix = (sessionId) => `${sessionId}_lap_`;
 const LEGACY_LAP_NUMBER = "COALESCE(l.lap_number, CAST(substr(tp.lap_id, length(?) + 1) AS INTEGER))";
+function isTelemetrySchemaMissing(error) {
+  const message = `${error?.message ?? error} ${error?.cause?.message ?? ""}`;
+  return /no such table: (?:main\.)?telemetry_(?:batches|stops)\b/i.test(message);
+}
+
 // Deployments may reach the Worker before the additive D1 schema is applied.
 async function readWithLegacySchema(read, fallback) {
   try {
     return await read();
   } catch (error) {
-    const message = `${error?.message ?? error} ${error?.cause?.message ?? ""}`;
-    if (!/no such table: (?:main\.)?telemetry_(?:batches|stops)\b/i.test(message)) throw error;
+    if (!isTelemetrySchemaMissing(error)) throw error;
     return fallback();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Worker: fetch (PRODUCER) + queue (CONSUMER)
-// ---------------------------------------------------------------------------
+async function persistMessages(messages, env) {
+  const write = async () => {
+    const statements = messages.flatMap((message) => storeMessage(message, env));
+    if (!statements.length) return false;
+    await env.DB.batch(statements);
+    return true;
+  };
+
+  try {
+    return await write();
+  } catch (error) {
+    if (!isTelemetrySchemaMissing(error)) throw error;
+  }
+
+  // Keep the additive migration in sync with schema.sql for older D1 deployments.
+  // A retry is safe when several requests initialize the schema concurrently.
+  await env.DB.batch([
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS telemetry_batches (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         session_id TEXT NOT NULL,
+         end_ts INTEGER NOT NULL,
+         lat REAL NOT NULL,
+         lon REAL NOT NULL,
+         speed REAL NOT NULL,
+         bearing REAL NOT NULL,
+         slices TEXT NOT NULL,
+         UNIQUE (session_id, end_ts)
+       )`
+    ),
+    env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_telemetry_batch_cursor ON telemetry_batches(session_id, id)"
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS telemetry_stops (
+         session_id TEXT PRIMARY KEY,
+         stop_ts INTEGER NOT NULL
+       )`
+    ),
+  ]);
+  return write();
+}
 
 export default {
-  // ── PRODUCER: Preia POST-ul de la telefon și îl trimite în Cloudflare Queue ──
   async fetch(request, env) {
     const url = new URL(request.url);
     const corsHeaders = {
@@ -319,20 +367,30 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // POST /api/telemetry — PRODUCER: bagă datele în coadă
     if (request.method === "POST" && (url.pathname === "/api/telemetry" || url.pathname === "/telemetry")) {
+      let data;
       try {
-        const data = await request.json();
-        await env.TELEMETRY_QUEUE.send(data);
-        return new Response(JSON.stringify({ status: "queued" }), {
-          status: 202,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: "Bad request" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        data = await request.json();
+      } catch {
+        return Response.json({ error: "Invalid JSON" }, { status: 400, headers: corsHeaders });
+      }
+
+      try {
+        if (!await persistMessages([data], env)) {
+          return Response.json({ error: "Invalid telemetry event" }, { status: 400, headers: corsHeaders });
+        }
+        return Response.json({ status: "stored" }, { status: 202, headers: corsHeaders });
+      } catch (error) {
+        console.error("Telemetry write failed", error);
+        try {
+          await env.TELEMETRY_QUEUE?.send(data);
+        } catch (queueError) {
+          console.error("Telemetry retry queue unavailable", queueError);
+        }
+        return Response.json(
+          { error: "Telemetry storage unavailable" },
+          { status: 503, headers: corsHeaders }
+        );
       }
     }
 
@@ -468,13 +526,12 @@ export default {
       return Response.json(results, { headers: corsHeaders });
     }
 
-    return new Response("F1 Telemetry API Online — Queue Architecture", { headers: corsHeaders });
+    return new Response("F1 Telemetry API Online", { headers: corsHeaders });
   },
 
   // Persist the queue batch atomically before acknowledging its messages.
   async queue(batch, env) {
-    const statements = batch.messages.flatMap((message) => storeMessage(message.body, env));
-    if (statements.length) await env.DB.batch(statements);
+    await persistMessages(batch.messages.map((message) => message.body), env);
     batch.ackAll();
   },
 };
