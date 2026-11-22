@@ -277,9 +277,44 @@ async function saveCompletedLap(ses, endTs, env) {
   await flushPointsToD1(ses, env);
   const lapId = `${ses.sessionId}_lap_${String(ses.lapNumber).padStart(2, "0")}`;
   const durationMs = Math.max(0, endTs - ses.lapStartTime);
-  const avgSpeed = ses.lapPointCount > 0
-    ? Number((ses.lapSpeedSum / ses.lapPointCount).toFixed(1))
-    : 0;
+
+  // Agregare matematică sigură direct peste punctele salvate în D1
+  let maxSpeed = ses.lapMaxSpeed || 0;
+  let avgSpeed = ses.lapPointCount > 0 ? Number((ses.lapSpeedSum / ses.lapPointCount).toFixed(1)) : 0;
+  let maxGLat = Number((ses.lapMaxGLat || 0).toFixed(2));
+  let maxGBrake = Number((ses.lapMaxGBrake || 0).toFixed(2));
+
+  try {
+    const { results: agg } = await env.DB.prepare(
+      `SELECT 
+         MAX(speed_kmh) as max_spd, 
+         AVG(speed_kmh) as avg_spd, 
+         MAX(ABS(g_lat)) as max_glat, 
+         MIN(g_lon) as min_glon 
+       FROM telemetry_points 
+       WHERE lap_id = ?`
+    )
+      .bind(lapId)
+      .all();
+
+    if (agg && agg.length > 0) {
+      if (agg[0].max_spd !== null && agg[0].max_spd !== undefined) {
+        maxSpeed = Math.max(maxSpeed, agg[0].max_spd);
+      }
+      if (agg[0].avg_spd !== null && agg[0].avg_spd !== undefined) {
+        avgSpeed = Number(agg[0].avg_spd.toFixed(1));
+      }
+      if (agg[0].max_glat !== null && agg[0].max_glat !== undefined) {
+        maxGLat = Number(Math.max(maxGLat, agg[0].max_glat).toFixed(2));
+      }
+      if (agg[0].min_glon !== null && agg[0].min_glon !== undefined) {
+        const brake = agg[0].min_glon < 0 ? Math.abs(agg[0].min_glon) : 0;
+        maxGBrake = Number(Math.max(maxGBrake, brake).toFixed(2));
+      }
+    }
+  } catch (err) {
+    console.error("Aggregation error in saveCompletedLap:", err);
+  }
 
   await env.DB.prepare(
     "INSERT OR REPLACE INTO laps (lap_id, session_id, lap_number, duration_ms, max_speed_kmh, avg_speed_kmh, max_g_lat, max_g_brake) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -289,10 +324,10 @@ async function saveCompletedLap(ses, endTs, env) {
       ses.sessionId,
       ses.lapNumber,
       durationMs,
-      ses.lapMaxSpeed,
+      maxSpeed,
       avgSpeed,
-      Number(ses.lapMaxGLat.toFixed(2)),
-      Number(ses.lapMaxGBrake.toFixed(2))
+      maxGLat,
+      maxGBrake
     )
     .run();
 }
@@ -345,7 +380,28 @@ export default {
     if (lapsMatch) {
       const sessionId = decodeURIComponent(lapsMatch[2]);
       const { results } = await env.DB.prepare(
-        "SELECT * FROM laps WHERE session_id = ? ORDER BY lap_number ASC"
+        `SELECT 
+           l.lap_id,
+           l.session_id,
+           l.lap_number,
+           l.duration_ms,
+           ROUND(MAX(COALESCE(l.max_speed_kmh, 0), COALESCE(agg.max_spd, 0)), 1) as max_speed_kmh,
+           ROUND(COALESCE(agg.avg_spd, l.avg_speed_kmh, 0), 1) as avg_speed_kmh,
+           ROUND(MAX(COALESCE(ABS(l.max_g_lat), 0), COALESCE(agg.max_glat, 0)), 2) as max_g_lat,
+           ROUND(MAX(COALESCE(ABS(l.max_g_brake), 0), COALESCE(agg.max_gbrake, 0)), 2) as max_g_brake
+         FROM laps l
+         LEFT JOIN (
+           SELECT 
+             lap_id,
+             MAX(speed_kmh) as max_spd,
+             AVG(speed_kmh) as avg_spd,
+             MAX(ABS(g_lat)) as max_glat,
+             MAX(CASE WHEN g_lon < 0 THEN ABS(g_lon) ELSE 0 END) as max_gbrake
+           FROM telemetry_points
+           GROUP BY lap_id
+         ) agg ON l.lap_id = agg.lap_id
+         WHERE l.session_id = ?
+         ORDER BY l.lap_number ASC`
       )
         .bind(sessionId)
         .all();
