@@ -887,38 +887,41 @@ function Index() {
     const liveSpeed = isCurrentSessionLive
       ? (liveInterpolatedFrame?.speed_kmh ?? liveSessionState?.speedKmh ?? 0)
       : 0;
-    if (laps.length > 0) return Math.max(liveSpeed, ...laps.map((l) => l.max_speed_kmh));
-    if (allPoints.length > 0) return Math.max(liveSpeed, ...allPoints.map((p) => p.speed_kmh));
-    return liveSpeed;
+    const lapsMax = laps.length > 0 ? Math.max(...laps.map((l) => l.max_speed_kmh || 0)) : 0;
+    const pointsMax = allPoints.length > 0 ? Math.max(...allPoints.map((p) => p.speed_kmh || 0)) : 0;
+    return Math.max(liveSpeed, lapsMax, pointsMax);
   }, [laps, allPoints, isCurrentSessionLive, liveInterpolatedFrame, liveSessionState]);
 
   const maxGLat = useMemo(() => {
     const liveGLat = isCurrentSessionLive
       ? Math.abs(liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0)
       : 0;
-    if (laps.length > 0) return Math.max(liveGLat, ...laps.map((l) => l.max_g_lat));
-    if (allPoints.length > 0) return Math.max(liveGLat, ...allPoints.map((p) => Math.abs(p.g_lat)));
-    return liveGLat;
+    const lapsMax = laps.length > 0 ? Math.max(...laps.map((l) => Math.abs(l.max_g_lat || 0))) : 0;
+    const pointsMax = allPoints.length > 0 ? Math.max(...allPoints.map((p) => Math.abs(p.g_lat || 0))) : 0;
+    return Math.max(liveGLat, lapsMax, pointsMax);
   }, [laps, allPoints, isCurrentSessionLive, liveInterpolatedFrame, liveSessionState]);
 
   const maxGBrake = useMemo(() => {
     const liveGBrake = isCurrentSessionLive
       ? Math.max(0, -(liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0))
       : 0;
-    if (laps.length > 0) return Math.max(liveGBrake, ...laps.map((l) => l.max_g_brake));
-    if (allPoints.length > 0) return Math.max(liveGBrake, ...allPoints.map((p) => Math.max(0, -p.g_lon)));
-    return liveGBrake;
+    const lapsMax = laps.length > 0 ? Math.max(...laps.map((l) => Math.abs(l.max_g_brake || 0))) : 0;
+    const pointsMax = allPoints.length > 0 ? Math.max(...allPoints.map((p) => Math.max(0, -(p.g_lon || 0)))) : 0;
+    return Math.max(liveGBrake, lapsMax, pointsMax);
   }, [laps, allPoints, isCurrentSessionLive, liveInterpolatedFrame, liveSessionState]);
 
   const avgSpeed = useMemo(() => {
+    if (allPoints.length > 0) {
+      const moving = allPoints.filter((p) => p.speed_kmh > 0);
+      if (moving.length > 0) {
+        return allPoints.reduce((s, p) => s + p.speed_kmh, 0) / allPoints.length;
+      }
+    }
     if (laps.length > 0) {
       const valid = laps.filter((l) => l.avg_speed_kmh > 0);
       if (valid.length > 0) {
         return valid.reduce((s, l) => s + l.avg_speed_kmh, 0) / valid.length;
       }
-    }
-    if (allPoints.length > 0) {
-      return allPoints.reduce((s, p) => s + p.speed_kmh, 0) / allPoints.length;
     }
     return 0;
   }, [laps, allPoints]);
@@ -1895,6 +1898,18 @@ function Index() {
                         isValid && bestLap && !isBest && lap.duration_ms > 0
                           ? formatDelta(lap.duration_ms - bestLap.duration_ms)
                           : null;
+                      const lapPoints = telemetry.filter(
+                        (p) => p.lap_id === lap.lap_id || p.lap_number === lap.lap_number,
+                      );
+                      const displayMaxSpeed = lapPoints.length > 0
+                        ? Math.max(lap.max_speed_kmh || 0, ...lapPoints.map((p) => p.speed_kmh || 0))
+                        : lap.max_speed_kmh;
+                      const displayMaxGLat = lapPoints.length > 0
+                        ? Math.max(Math.abs(lap.max_g_lat || 0), ...lapPoints.map((p) => Math.abs(p.g_lat || 0)))
+                        : Math.abs(lap.max_g_lat);
+                      const displayMaxGBrake = lapPoints.length > 0
+                        ? Math.max(Math.abs(lap.max_g_brake || 0), ...lapPoints.map((p) => Math.max(0, -(p.g_lon || 0))))
+                        : Math.abs(lap.max_g_brake);
                       return (
                         <tr
                           key={lap.lap_id}
@@ -1951,12 +1966,12 @@ function Index() {
                             )}
                           </td>
                           <td>
-                            {lap.max_speed_kmh.toFixed(1)}{" "}
+                            {displayMaxSpeed.toFixed(1)}{" "}
                             <span className="text-muted-foreground">km/h</span>
                           </td>
-                          <td>{lap.max_g_lat.toFixed(2)} G</td>
+                          <td>{displayMaxGLat.toFixed(2)} G</td>
                           <td className="text-destructive">
-                            −{lap.max_g_brake.toFixed(2)} G
+                            −{displayMaxGBrake.toFixed(2)} G
                           </td>
                           <td>
                             <Button
