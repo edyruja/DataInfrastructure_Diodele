@@ -31,8 +31,7 @@ import {
   computeTrackBounds,
   projectPoints,
   projectCoordWithBounds,
-  snapPointToPolyline,
-  haversineMeters,
+  buildReplayTimeline,
   interpolateTelemetryPoint,
   extractGpsWaypoints,
   interpolateTrackPosition,
@@ -73,6 +72,8 @@ const G_ZOOM_LEVELS = [
   { maxG: 0.6, circles: ["0.2", "0.4", "0.6"] },
 ] as const;
 
+const EMPTY_TELEMETRY: TelemetryPoint[] = [];
+
 type ActiveLiveSession = {
   lastSeen: number;
   currentLap: number;
@@ -83,9 +84,19 @@ type ActiveLiveSession = {
   totalG: number;
   lat: number;
   lon: number;
-  deviceId: string;
-  trackName: string;
 };
+
+function mergeLivePoints(previous: TelemetryPoint[], incoming: TelemetryPoint[]): TelemetryPoint[] {
+  const key = (point: TelemetryPoint) =>
+    point.session_offset_ms ?? `${point.lap_id}:${point.lap_offset_ms}`;
+  const points = new Map(previous.map((point) => [key(point), point]));
+  for (const point of incoming) points.set(key(point), point);
+  return [...points.values()].sort((a, b) =>
+    a.session_offset_ms !== undefined && b.session_offset_ms !== undefined
+      ? a.session_offset_ms - b.session_offset_ms
+      : a.lap_number - b.lap_number || a.lap_offset_ms - b.lap_offset_ms
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -99,7 +110,7 @@ function Index() {
 
   const [laps, setLaps] = useState<ApiLap[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
-  const [selectedLapId, setSelectedLapId] = useState<string | null>(null);
+  const [selectedLapId, setSelectedLapId] = useState<string | null>();
   const [loading, setLoading] = useState(false);
 
   // Multi-device active live sessions state (session_id -> ActiveLiveSession)
@@ -129,11 +140,6 @@ function Index() {
   const lastTickTimeRef = useRef<number | null>(null);
 
   const lastLapRef = useRef<number>(1);
-  const sessionIdRef = useRef<string>(sessionId);
-
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
 
   // Current session's live state & status detection (Real-time tracking)
   const currentSessionObj = useMemo(() => {
@@ -151,9 +157,10 @@ function Index() {
     ? (Date.now() - currentSessionLastUpdateMs) / 1000
     : Infinity;
 
-  const isCurrentSessionLive = secondsSinceLastLive < 10;
+  const isCurrentSessionLive = currentSessionObj?.stop_ts == null && secondsSinceLastLive < 10;
   const isCurrentSessionRecent = !isCurrentSessionLive && secondsSinceLastLive < 60;
-  const liveTrackPoints = livePointsBySession[sessionId] ?? [];
+  const recordingRevision = isCurrentSessionLive ? undefined : currentSessionObj?.telemetry_revision;
+  const liveTrackPoints = livePointsBySession[sessionId] ?? EMPTY_TELEMETRY;
 
   // ── Ordered Sessions: LIVE sessions appear first, then RECENT, then RECORDED by updated_at ──
   const { liveSessions, recentSessions, recordedSessions } = useMemo(() => {
@@ -170,7 +177,7 @@ function Index() {
       const lastUpdateMs = lastUpdateStr ? new Date(lastUpdateStr).getTime() : 0;
       const secondsAgo = (now - lastUpdateMs) / 1000;
 
-      if (secondsAgo < 10) {
+      if (s.stop_ts == null && secondsAgo < 10) {
         liveList.push(s);
       } else if (secondsAgo < 60) {
         recentList.push(s);
@@ -207,7 +214,6 @@ function Index() {
       if (first) {
         setSessionId((prev) => {
           // If already viewing an active live session, stay on it
-          if (prev && liveSessionsMap[prev]) return prev;
           if (!prev || selectFirst || !data.some((s) => s.session_id === prev)) {
             return first.session_id;
           }
@@ -220,112 +226,86 @@ function Index() {
     } finally {
       setSessionsLoading(false);
     }
-  }, [liveSessionsMap]);
+  }, []);
 
-  // ── Near Real-Time Polling for live session chunks (No WebSocket) ──────────
   useEffect(() => {
-    let isMounted = true;
-    const pollIntervalMs = 1500; // poll every 1.5s for live telemetry chunks
+    liveBufferRef.current = [];
+    livePlayheadMsRef.current = null;
+    setLiveInterpolatedFrame(null);
+    setLaps([]);
+    setTelemetry([]);
+    setSelectedLapId(undefined);
+    lastLapRef.current = 1;
+  }, [sessionId]);
 
-    const pollLive = async () => {
-      if (!isMounted || !sessionId) return;
+  useEffect(() => {
+    if (!sessionId) return;
+    const controller = new AbortController();
+    let polling = false;
+
+    async function pollLive() {
+      if (polling || controller.signal.aborted) return;
+      polling = true;
       try {
-        const livePts = await fetchLiveTelemetry(sessionId, 3500);
-        if (!isMounted || !Array.isArray(livePts) || livePts.length === 0) {
-          setLiveSessionsMap((prev) => {
-            if (!prev[sessionId]) return prev;
-            const next = { ...prev };
+        const points = await fetchLiveTelemetry(sessionId, 3500, controller.signal);
+        if (controller.signal.aborted) return;
+        const newest = points.at(-1);
+        if (!newest) {
+          setLiveSessionsMap((previous) => {
+            if (!previous[sessionId]) return previous;
+            const next = { ...previous };
             delete next[sessionId];
             return next;
           });
           return;
         }
 
-        const now = Date.now();
-        const newest = livePts[livePts.length - 1]!;
-        const prevBuf = liveBufferRef.current;
-        const prevNewestOffset =
-          prevBuf.length > 0 ? prevBuf[prevBuf.length - 1]!.lap_offset_ms : -1;
+        const currentLap = newest.lap_number;
+        const previousLap = liveBufferRef.current.at(-1)?.lap_id;
+        if (newest.lap_id !== previousLap) livePlayheadMsRef.current = null;
+        liveBufferRef.current = points.filter((point) => point.lap_id === newest.lap_id);
 
-        // If new points arrived in D1
-        if (newest.lap_offset_ms > prevNewestOffset || prevBuf.length === 0) {
-          const currentLapNum = newest.lap_number || 1;
-          const targetSession = sessions.find((s) => s.session_id === sessionId);
+        setLiveSessionsMap((previous) => ({
+          ...previous,
+          [sessionId]: {
+            lastSeen: Date.now(),
+            currentLap,
+            currentLapTimeMs: newest.lap_offset_ms,
+            speedKmh: newest.speed_kmh,
+            gLat: newest.g_lat,
+            gLon: newest.g_lon,
+            totalG: Math.hypot(newest.g_lat, newest.g_lon),
+            lat: newest.lat,
+            lon: newest.lon,
+          },
+        }));
 
-          setLiveSessionsMap((prev) => ({
-            ...prev,
-            [sessionId]: {
-              lastSeen: now,
-              currentLap: currentLapNum,
-              currentLapTimeMs: newest.lap_offset_ms,
-              speedKmh: newest.speed_kmh,
-              gLat: newest.g_lat,
-              gLon: newest.g_lon,
-              totalG: Number(Math.hypot(newest.g_lat, newest.g_lon).toFixed(2)),
-              lat: newest.lat,
-              lon: newest.lon,
-              deviceId: targetSession?.device_id || "Active Driver",
-              trackName: targetSession?.track_name || "Circuit",
-            },
-          }));
+        setLivePointsBySession((previous) => ({
+          ...previous,
+          [sessionId]: mergeLivePoints(previous[sessionId] ?? [], points),
+        }));
 
-          // Merge incoming points into playout buffer
-          const existingOffsets = new Set(prevBuf.map((p) => p.lap_offset_ms));
-          const fresh = livePts.filter((p) => !existingOffsets.has(p.lap_offset_ms));
-
-          if (fresh.length > 0) {
-            const updatedBuf = [...prevBuf, ...fresh].sort(
-              (a, b) => a.lap_offset_ms - b.lap_offset_ms,
-            );
-            liveBufferRef.current = updatedBuf.slice(-300);
-
-            // Accumulate distinct GPS points into livePointsBySession
-            setLivePointsBySession((prev) => {
-              const sessionPts = prev[sessionId] ?? [];
-              const last = sessionPts[sessionPts.length - 1];
-              const validGps = fresh.filter((p) => p.lat !== 0 && p.lon !== 0);
-              if (validGps.length === 0) return prev;
-
-              const filtered: TelemetryPoint[] = [];
-              let refPt = last;
-              for (const p of validGps) {
-                if (refPt) {
-                  const dist = haversineMeters(refPt.lat, refPt.lon, p.lat, p.lon);
-                  if (dist >= 1.0 || p.speed_kmh >= 2.0) {
-                    filtered.push(p);
-                    refPt = p;
-                  }
-                } else {
-                  filtered.push(p);
-                  refPt = p;
-                }
-              }
-              return {
-                ...prev,
-                [sessionId]: [...sessionPts, ...filtered],
-              };
-            });
-          }
-
-          // If current lap advanced on active session, refresh laps from DB
-          if (currentLapNum > lastLapRef.current) {
-            lastLapRef.current = currentLapNum;
-            fetchLaps(sessionId).then(setLaps).catch(() => {});
+        if (currentLap !== lastLapRef.current) {
+          const nextLaps = await fetchLaps(sessionId, controller.signal);
+          if (!controller.signal.aborted) {
+            lastLapRef.current = currentLap;
+            setLaps(nextLaps);
           }
         }
       } catch {
-        // network retry silent
+        // The next poll retries transient failures.
+      } finally {
+        polling = false;
       }
-    };
+    }
 
-    const timer = setInterval(pollLive, pollIntervalMs);
-    pollLive();
-
+    void pollLive();
+    const timer = setInterval(pollLive, 1500);
     return () => {
-      isMounted = false;
+      controller.abort();
       clearInterval(timer);
     };
-  }, [sessionId, sessions]);
+  }, [sessionId]);
 
   // Periodic heartbeat & session background poll (every 4.5s)
   useEffect(() => {
@@ -384,13 +364,13 @@ function Index() {
         if (lag > 2500) pace = 1.25;
         else if (lag < 400) pace = 0.75;
 
-        const nextPlayhead = Math.min(newestOffset, livePlayheadMsRef.current + deltaMs * pace);
+        const nextPlayhead = Math.max(
+          oldestOffset,
+          Math.min(newestOffset, livePlayheadMsRef.current + deltaMs * pace),
+        );
         livePlayheadMsRef.current = nextPlayhead;
 
-        const frame = interpolateTelemetryPoint(buffer, nextPlayhead);
-        if (frame) {
-          setLiveInterpolatedFrame(frame);
-        }
+        setLiveInterpolatedFrame(interpolateTelemetryPoint(buffer, nextPlayhead));
       }
 
       liveAnimFrameRef.current = requestAnimationFrame(tickLive);
@@ -412,60 +392,37 @@ function Index() {
     loadSessions(true);
   }, [loadSessions]);
 
-  // ── When sessionId changes: fetch laps + telemetry ───────────────────────
   useEffect(() => {
-    if (!sessionId) {
-      setLaps([]);
-      setTelemetry([]);
-      return;
-    }
+    if (!sessionId) return;
     const ac = new AbortController();
     setLoading(true);
-    setSelectedLapId(null);
-    lastLapRef.current = 1;
 
-    Promise.all([
-      fetchLaps(sessionId, ac.signal).catch((err) => {
-        console.warn("fetchLaps error:", err);
-        return [] as ApiLap[];
-      }),
-      fetchTelemetry(sessionId, ac.signal).catch((err) => {
-        console.warn("fetchTelemetry error:", err);
-        return [] as TelemetryPoint[];
-      }),
-    ])
+    Promise.all([fetchLaps(sessionId, ac.signal), fetchTelemetry(sessionId, ac.signal)])
       .then(([lapData, telData]) => {
+        if (ac.signal.aborted) return;
         setLaps(lapData);
         setTelemetry(telData);
-        setLivePointsBySession((prev) => {
-          if (prev[sessionId]?.length) return prev;
-          return { ...prev, [sessionId]: telData };
-        });
-        if (lapData.length > 0) {
-          lastLapRef.current = Math.max(...lapData.map((l) => l.lap_number));
-          // Automatically select the best valid completed lap by default
-          const validCandidates = lapData.filter((l) => isLapValid(l, lapData, telData));
-          const best = validCandidates.reduce<ApiLap | null>(
-            (b, l) => (!b || (l.duration_ms > 0 && l.duration_ms < b.duration_ms) ? l : b),
-            null,
-          );
-          if (best) {
-            setSelectedLapId(best.lap_id);
-          } else {
-            setSelectedLapId(lapData[0]!.lap_id);
-          }
-        }
+        setLivePointsBySession((previous) => ({
+          ...previous,
+          [sessionId]: mergeLivePoints(telData, previous[sessionId] ?? []),
+        }));
       })
-      .finally(() => setLoading(false));
-
+      .catch((error) => {
+        if (!ac.signal.aborted) console.warn("Could not load session telemetry", error);
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setLoading(false);
+      });
     return () => ac.abort();
-  }, [sessionId]);
+  }, [sessionId, isCurrentSessionLive, recordingRevision]);
 
   // ── Computed values ───────────────────────────────────────────────────────
   // Filter completed and valid laps only (incomplete or aborted laps under 15s are excluded)
   const validLaps = useMemo(() => {
     return laps.filter((l) => isLapValid(l, laps, telemetry));
   }, [laps, telemetry]);
+
+  const validLapIds = useMemo(() => new Set(validLaps.map((lap) => lap.lap_id)), [validLaps]);
 
   const bestLap = useMemo(() => {
     return validLaps.reduce<ApiLap | null>(
@@ -477,18 +434,15 @@ function Index() {
   // Effective active lap: in recorded mode, defaults to the best completed lap!
   const effectiveLapId = useMemo(() => {
     if (isCurrentSessionLive) return null;
-    if (selectedLapId) return selectedLapId;
+    if (selectedLapId === null) return null;
+    if (selectedLapId && laps.some((lap) => lap.lap_id === selectedLapId)) return selectedLapId;
     return bestLap?.lap_id ?? (laps.length > 0 ? laps[0]?.lap_id : null);
   }, [isCurrentSessionLive, selectedLapId, bestLap, laps]);
 
-  // Active telemetry for recorded / filtered views
   const displayedTelemetry = useMemo(() => {
     if (isCurrentSessionLive) return telemetry;
-    if (effectiveLapId) {
-      const filtered = telemetry.filter((p) => p.lap_id === effectiveLapId);
-      if (filtered.length > 0) return filtered;
-    }
-    return telemetry;
+    if (effectiveLapId) return telemetry.filter((point) => point.lap_id === effectiveLapId);
+    return buildReplayTimeline(telemetry);
   }, [isCurrentSessionLive, effectiveLapId, telemetry]);
 
   // Duration and base time of current displayed telemetry
@@ -560,115 +514,44 @@ function Index() {
     return interpolateTelemetryPoint(displayedTelemetry, baseTimeMs + replayTimeMs);
   }, [isReplaying, replayTimeMs, displayedTelemetry, baseTimeMs]);
 
-  // ── Reference Track: the established circuit path ────────────────────────
-  // On Lap 1 (live), track is being discovered live (referenceTrack = empty).
-  // From Lap 2 onwards (or for recorded sessions), referenceTrack holds Lap 1 points (the circuit layout).
+  const currentLiveLap = liveSessionState?.currentLap ?? 1;
   const referenceTrack = useMemo(() => {
-    // 1. Recorded session from database:
-    if (!isCurrentSessionLive) {
-      if (telemetry.length === 0) return [];
-      if (effectiveLapId) {
-        const lapPts = telemetry.filter((p) => p.lap_id === effectiveLapId);
-        if (lapPts.length > 8) return lapPts;
-      }
-      const lap1 = telemetry.filter((p) => p.lap_number === 1);
-      return lap1.length > 8 ? lap1 : telemetry;
-    }
+    if (!isCurrentSessionLive) return displayedTelemetry;
+    const firstLap = liveTrackPoints.filter((point) => point.lap_number === 1);
+    return firstLap.length > 0 ? firstLap : liveTrackPoints;
+  }, [isCurrentSessionLive, displayedTelemetry, liveTrackPoints]);
 
-    // 2. Live session:
-    // When Lap 1 is complete (current_lap >= 2 or completed laps exist):
-    const currentLiveLap = liveSessionState?.currentLap ?? 1;
-    if (currentLiveLap >= 2 || laps.length > 0) {
-      const lap1Live = liveTrackPoints.filter((p) => p.lap_number === 1);
-      if (lap1Live.length > 8) return lap1Live;
-      const lap1Tel = telemetry.filter((p) => p.lap_number === 1);
-      if (lap1Tel.length > 8) return lap1Tel;
-    }
+  const liveLapPoints = useMemo(
+    () => liveTrackPoints.filter((point) => point.lap_number === currentLiveLap),
+    [liveTrackPoints, currentLiveLap],
+  );
+  const trackWaypoints = useMemo(() => extractGpsWaypoints(referenceTrack), [referenceTrack]);
+  const liveWaypoints = useMemo(() => extractGpsWaypoints(liveLapPoints), [liveLapPoints]);
+  const trackBounds = useMemo(() => computeTrackBounds(trackWaypoints), [trackWaypoints]);
+  const fullProjectedTrack = useMemo(
+    () => projectPoints(trackWaypoints, 400, 220, 24, trackBounds),
+    [trackWaypoints, trackBounds],
+  );
+  const smoothFullTrack = useMemo(
+    () => interpolateTrackSpline(fullProjectedTrack),
+    [fullProjectedTrack],
+  );
+  const trackPath = useMemo(() => smoothFullTrack.map((point, index) =>
+    `${index === 0 || point.breakBefore ? "M" : "L"}${point.x.toFixed(1)},${point.y.toFixed(1)}`
+  ).join(" "), [smoothFullTrack]);
 
-    // Still in live Lap 1: no reference track yet (actively being created)
-    return [];
-  }, [isCurrentSessionLive, telemetry, selectedLapId, liveSessionState?.currentLap, laps.length, liveTrackPoints]);
-
-  // Points used to determine circuit geometry and compute bounds
-  const activeTrackPoints = useMemo(() => {
-    if (referenceTrack.length > 0) {
-      return referenceTrack;
-    }
-    // During live Lap 1: use the accumulated live points
-    if (isCurrentSessionLive) {
-      return liveTrackPoints.length > 0 ? liveTrackPoints : telemetry;
-    }
-    return telemetry;
-  }, [referenceTrack, isCurrentSessionLive, liveTrackPoints, telemetry]);
-
-  const isClosedLoop = useMemo(() => {
-    if (activeTrackPoints.length < 15) return false;
-    // Nu forțăm închiderea traseului dacă nu există cel puțin un tur complet finalizat
-    if (laps.length === 0) return false;
-    const first = activeTrackPoints[0]!;
-    const last = activeTrackPoints[activeTrackPoints.length - 1]!;
-    return haversineMeters(first.lat, first.lon, last.lat, last.lon) < 25;
-  }, [activeTrackPoints, laps.length]);
-
-  // Track GPS waypoints: deduplicates consecutive stationary points for continuous 60 FPS trajectory
-  const trackWaypoints = useMemo(() => {
-    return extractGpsWaypoints(activeTrackPoints);
-  }, [activeTrackPoints]);
-
-  // Track bounding box (smooth auto-expansion during Lap 1, locked on Lap 2+)
-  const trackBounds = useMemo(() => {
-    const pts = trackWaypoints.length > 0 ? trackWaypoints : activeTrackPoints;
-    return computeTrackBounds(pts);
-  }, [trackWaypoints, activeTrackPoints]);
-
-  // Full projected track points inside SVG viewBox (400 x 220)
-  const fullProjectedTrack = useMemo(() => {
-    const pts = trackWaypoints.length > 0 ? trackWaypoints : activeTrackPoints;
-    return projectPoints(pts, 400, 220, 24, trackBounds);
-  }, [trackWaypoints, activeTrackPoints, trackBounds]);
-
-  // Smooth Catmull-Rom spline interpolated track (silky road curves for both live and recorded sessions)
-  const smoothFullTrack = useMemo(() => {
-    return interpolateTrackSpline(fullProjectedTrack, isClosedLoop, 4);
-  }, [fullProjectedTrack, isClosedLoop]);
-
-  // Smooth 60 FPS Track Position for Replay (interpolates continuously along waypoints)
+  const replayTarget = isReplaying ? baseTimeMs + (replayTimeMs ?? 0) : null;
   const replayTrackPos = useMemo(() => {
-    if (!isReplaying || replayTimeMs === null || trackWaypoints.length === 0) return null;
-    return interpolateTrackPosition(trackWaypoints, baseTimeMs + replayTimeMs);
-  }, [isReplaying, replayTimeMs, trackWaypoints, baseTimeMs]);
-
-  // Dynamic track polyline: In Replay Mode, evolves dynamically at 60 FPS up to current car position!
-  const projectedTrack = useMemo(() => {
-    if (!isReplaying || !replayTrackPos || !trackBounds || fullProjectedTrack.length === 0) {
-      return fullProjectedTrack;
+    const first = trackWaypoints[0];
+    const last = trackWaypoints.at(-1);
+    if (replayTarget === null || !first || !last || replayTarget < first.timeMs || replayTarget > last.timeMs) {
+      return null;
     }
-    const sliced = fullProjectedTrack.slice(0, replayTrackPos.index + 1);
-    const carPos = projectCoordWithBounds(
-      replayTrackPos.lat,
-      replayTrackPos.lon,
-      trackBounds,
-      400,
-      220,
-      24,
-    );
-    return [
-      ...sliced,
-      {
-        x: carPos.x,
-        y: carPos.y,
-        speed: replayTrackPos.speed_kmh,
-        apex: 0 as const,
-      },
-    ];
-  }, [isReplaying, replayTrackPos, fullProjectedTrack, trackBounds]);
+    return interpolateTrackPosition(trackWaypoints, replayTarget);
+  }, [replayTarget, trackWaypoints]);
 
-  const startPoint = smoothFullTrack.length > 0 ? smoothFullTrack[0] : null;
-
-  const endPoint =
-    smoothFullTrack.length > 1 && !isClosedLoop
-      ? smoothFullTrack[smoothFullTrack.length - 1]
-      : null;
+  const startPoint = smoothFullTrack[0];
+  const endPoint = smoothFullTrack.length > 1 ? smoothFullTrack.at(-1) : undefined;
 
   // Hover handler for circuit map SVG: locates nearest track point and syncs speed + G-force
   const handleTrackMouseMove = useCallback(
@@ -709,175 +592,53 @@ function Index() {
     return Math.max(...list.map((p) => p.speed_kmh));
   }, [isCurrentSessionLive, liveTrackPoints, displayedTelemetry]);
 
-  // ── Live / Replay Car Dot ────────────────────────────────────────────────
-  // In Replay Mode: car moves continuously at 60 FPS along the circuit track without pausing or jumping.
-  // In Live Mode: smoothly glides using 60 FPS interpolated buffered chunk coordinates.
   const carDot = useMemo(() => {
-    // 1. Replay Mode: mișcare fluidă 60 FPS interpolată de-a lungul traseului
-    if (isReplaying && replayTrackPos && trackBounds) {
-      const pos = projectCoordWithBounds(
-        replayTrackPos.lat,
-        replayTrackPos.lon,
-        trackBounds,
-        400,
-        220,
-        24,
-      );
-      return {
-        x: pos.x,
-        y: pos.y,
-        speed: replayTrackPos.speed_kmh,
-        isSnapped: false,
-      };
+    if (!trackBounds) return null;
+    if (isReplaying) {
+      return replayTrackPos
+        ? projectCoordWithBounds(replayTrackPos.lat, replayTrackPos.lon, trackBounds)
+        : null;
     }
-
-    // 2. Live Mode:
-    if (!isCurrentSessionLive || fullProjectedTrack.length === 0 || !trackBounds) {
-      return null;
-    }
-
-    const liveLat = liveInterpolatedFrame?.lat ?? liveSessionState?.lat;
-    const liveLon = liveInterpolatedFrame?.lon ?? liveSessionState?.lon;
-    const liveSpd = liveInterpolatedFrame?.speed_kmh ?? liveSessionState?.speedKmh ?? 0;
-    const currentLiveLap = liveSessionState?.currentLap ?? 1;
-
-    if (liveLat && liveLon) {
-      const rawPos = projectCoordWithBounds(liveLat, liveLon, trackBounds, 400, 220, 24);
-
-      // From Lap 2 onwards: Snap to established reference circuit track
-      if (referenceTrack.length > 0 && currentLiveLap >= 2) {
-        const snapped = snapPointToPolyline(rawPos, fullProjectedTrack, 45);
-        return {
-          x: snapped.x,
-          y: snapped.y,
-          speed: liveSpd,
-          segmentIndex: snapped.segmentIndex,
-          isSnapped: true,
-        };
-      }
-
-      return {
-        x: rawPos.x,
-        y: rawPos.y,
-        speed: liveSpd,
-        segmentIndex: fullProjectedTrack.length - 1,
-        isSnapped: false,
-      };
-    }
-
-    // Fallback during live Lap 1 if GPS fix not yet interpolated
-    const head = fullProjectedTrack[fullProjectedTrack.length - 1];
-    if (!head) return null;
-    return {
-      x: head.x,
-      y: head.y,
-      speed: liveSpd,
-      segmentIndex: fullProjectedTrack.length - 1,
-      isSnapped: false,
-    };
+    if (!isCurrentSessionLive) return null;
+    if (!liveInterpolatedFrame && livePlayheadMsRef.current !== null) return null;
+    const time = liveInterpolatedFrame?.timeMs ?? liveSessionState?.currentLapTimeMs;
+    if (time === undefined) return null;
+    const first = liveWaypoints[0];
+    const last = liveWaypoints.at(-1);
+    if (!first || !last || time < first.timeMs || time > last.timeMs) return null;
+    const position = interpolateTrackPosition(liveWaypoints, time);
+    return position ? projectCoordWithBounds(position.lat, position.lon, trackBounds) : null;
   }, [
     isReplaying,
     replayTrackPos,
-    fullProjectedTrack,
+    trackBounds,
     isCurrentSessionLive,
     liveInterpolatedFrame,
     liveSessionState,
-    trackBounds,
-    referenceTrack.length,
+    liveWaypoints,
   ]);
 
-  // ── Exact Replay Point for G-G diagram: sampled from smoothFullTrack using IDENTICAL logic to hoveredPoint (white dot) ──
-  const replayTrackPoint = useMemo(() => {
-    if (!isReplaying || !carDot) return null;
-    const trackSource = smoothFullTrack.length > 0 ? smoothFullTrack : fullProjectedTrack;
-    if (trackSource.length === 0) return null;
-
-    let closest: Projected | null = null;
-    let minDistanceSq = Infinity;
-
-    for (let i = 0; i < trackSource.length; i++) {
-      const pt = trackSource[i]!;
-      const dx = pt.x - carDot.x;
-      const dy = pt.y - carDot.y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 < minDistanceSq) {
-        minDistanceSq = d2;
-        closest = pt;
-      }
-    }
-    return closest;
-  }, [isReplaying, carDot, smoothFullTrack, fullProjectedTrack]);
-
-  // Dynamic speed trace polyline:
-  // - In Replay Mode: evolves dynamically at 60 FPS up to the replay car position, smoothed with spline.
-  // - In Live Mode on Lap 2+: renders ONLY the colored trace for current lap behind the moving car.
-  // - In Live Mode on Lap 1: follows the live car as Lap 1 is driven.
-  // - In Recorded Sessions: renders the full trace of the selected lap.
   const activeSpeedTrace = useMemo(() => {
-    if (isReplaying) {
-      return interpolateTrackSpline(projectedTrack, false, 3);
+    if (!trackBounds) return [];
+    if (isCurrentSessionLive) {
+      return interpolateTrackSpline(projectPoints(liveWaypoints, 400, 220, 24, trackBounds));
     }
+    if (replayTarget === null) return smoothFullTrack;
 
-    const currentLiveLap = liveSessionState?.currentLap ?? 1;
-    const isLiveLap2Plus =
-      isCurrentSessionLive && (currentLiveLap >= 2 || laps.length > 0) && referenceTrack.length > 0;
-
-    if (isLiveLap2Plus && trackBounds) {
-      const currentLapPoints = liveTrackPoints.filter(
-        (p) => (p.lap_number ?? 1) === currentLiveLap,
-      );
-      if (currentLapPoints.length === 0) {
-        return carDot ? [carDot] : [];
-      }
-      const pts = currentLapPoints.map((p) => {
-        const raw = projectCoordWithBounds(p.lat, p.lon, trackBounds, 400, 220, 24);
-        const snapped =
-          fullProjectedTrack.length > 1 ? snapPointToPolyline(raw, fullProjectedTrack, 30) : raw;
-        return {
-          x: snapped.x,
-          y: snapped.y,
-          speed: p.speed_kmh ?? 0,
-          apex: p.is_corner_apex ?? 0,
-        };
-      });
-      if (carDot && pts.length > 0) {
-        pts[pts.length - 1] = {
-          x: carDot.x,
-          y: carDot.y,
-          speed: carDot.speed,
-          apex: 0 as const,
-        };
-      }
-      return interpolateTrackSpline(pts, false, 3);
+    const trace = fullProjectedTrack.filter((point) => point.timeMs! <= replayTarget);
+    if (carDot && replayTrackPos && (trace.at(-1)?.timeMs ?? -1) < replayTarget) {
+      trace.push({ ...carDot, speed: replayTrackPos.speed_kmh, apex: 0 });
     }
-
-    if (isCurrentSessionLive && trackBounds && liveTrackPoints.length > 1) {
-      const pts = liveTrackPoints.map((p) => {
-        const { x, y } = projectCoordWithBounds(p.lat, p.lon, trackBounds, 400, 220, 24);
-        return {
-          x,
-          y,
-          speed: p.speed_kmh ?? 0,
-          apex: p.is_corner_apex ?? 0,
-        };
-      });
-      return interpolateTrackSpline(pts, isClosedLoop, 3);
-    }
-
-    return smoothFullTrack;
+    return interpolateTrackSpline(trace);
   }, [
-    isReplaying,
-    projectedTrack,
     isCurrentSessionLive,
-    liveSessionState?.currentLap,
-    laps.length,
-    referenceTrack.length,
+    liveWaypoints,
     trackBounds,
-    liveTrackPoints,
+    replayTarget,
     fullProjectedTrack,
     smoothFullTrack,
     carDot,
-    isClosedLoop,
+    replayTrackPos,
   ]);
 
   // Overall points buffer for KPIs
@@ -925,26 +686,26 @@ function Index() {
 
   const displaySpeed = isCurrentSessionLive
     ? (liveInterpolatedFrame?.speed_kmh ?? liveSessionState?.speedKmh ?? 0)
-    : isReplaying && currentReplayFrame
-      ? currentReplayFrame.speed_kmh
+    : isReplaying
+      ? currentReplayFrame?.speed_kmh
       : maxSpeed;
 
   const currentGLat = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0)
-    : isReplaying && replayTrackPoint
-      ? (replayTrackPoint.g_lat ?? 0)
+    : isReplaying
+      ? (currentReplayFrame?.g_lat ?? 0)
       : maxGLat;
 
   const currentGLon = isCurrentSessionLive
     ? (liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0)
-    : isReplaying && replayTrackPoint
-      ? (replayTrackPoint.g_lon ?? 0)
+    : isReplaying
+      ? (currentReplayFrame?.g_lon ?? 0)
       : -maxGBrake;
 
   const totalG = isCurrentSessionLive
     ? (liveInterpolatedFrame?.total_g ?? liveSessionState?.totalG ?? 0)
-    : isReplaying && replayTrackPoint
-      ? Number(Math.hypot(replayTrackPoint.g_lat ?? 0, replayTrackPoint.g_lon ?? 0).toFixed(2))
+    : isReplaying && currentReplayFrame
+      ? Number(Math.hypot(currentReplayFrame.g_lat ?? 0, currentReplayFrame.g_lon ?? 0).toFixed(2))
       : 0;
 
   // Active zoom level on G-G Diagram
@@ -960,7 +721,7 @@ function Index() {
     ? (hoveredPoint.g_lon ?? 0)
     : currentGLon;
 
-  const isGActive = Boolean(hoveredPoint) || isCurrentSessionLive || isReplaying;
+  const isGActive = Boolean(hoveredPoint || currentReplayFrame) || isCurrentSessionLive;
 
   // SVG G-meter needle dot position
   const rawGx = 110 + (isGActive ? effectiveGLat : 0) * scalePxPerG;
@@ -972,12 +733,7 @@ function Index() {
   const session = orderedSessions.find((s) => s.session_id === sessionId);
 
   // Visible laps: All laps or Valid only (incomplete laps filtered out)
-  const visibleLaps = useMemo(() => {
-    if (validOnly) {
-      return laps.filter((l) => isLapValid(l, laps, telemetry));
-    }
-    return laps;
-  }, [validOnly, laps, telemetry]);
+  const visibleLaps = validOnly ? validLaps : laps;
 
   // G-G scatter: in Replay mode, shows points appearing sequentially up to current timestamp!
   const gSample = useMemo(() => {
@@ -1007,7 +763,7 @@ function Index() {
     },
     {
       label: isCurrentSessionLive ? "Live speed" : isReplaying ? "Replay speed" : "Max speed",
-      value: displaySpeed.toFixed(1),
+      value: displaySpeed?.toFixed(1) ?? "—",
       unit: "km/h",
       sub: isCurrentSessionLive
         ? "Live"
@@ -1028,8 +784,8 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${(liveInterpolatedFrame?.g_lat ?? liveSessionState?.gLat ?? 0).toFixed(2)} G`
-        : isReplaying && replayTrackPoint
-          ? `Current: ${(replayTrackPoint.g_lat ?? 0).toFixed(2)} G`
+        : isReplaying && currentReplayFrame
+          ? `Current: ${(currentReplayFrame.g_lat ?? 0).toFixed(2)} G`
           : "Session max",
     },
     {
@@ -1038,8 +794,8 @@ function Index() {
       unit: "G",
       sub: isCurrentSessionLive
         ? `Current: ${Math.abs(liveInterpolatedFrame?.g_lon ?? liveSessionState?.gLon ?? 0).toFixed(2)} G`
-        : isReplaying && replayTrackPoint
-          ? `Current: ${Math.abs(replayTrackPoint.g_lon ?? 0).toFixed(2)} G`
+        : isReplaying && currentReplayFrame
+          ? `Current: ${Math.abs(currentReplayFrame.g_lon ?? 0).toFixed(2)} G`
           : "Session max",
       negative: true,
     },
@@ -1145,7 +901,7 @@ function Index() {
             {isCurrentSessionLive ? (
               <span className="flex items-center gap-2 rounded-full border border-green-500/30 bg-green-500/10 px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-green-400">
                 <span className="size-2 rounded-full animate-pulse bg-green-500" />
-                ● LIVE {liveSessionState?.deviceId ? `· ${liveSessionState.deviceId}` : ""}
+                ● LIVE {session?.device_id ? `· ${session.device_id}` : ""}
               </span>
             ) : isCurrentSessionRecent ? (
               <span className="flex items-center gap-2 rounded-full border border-yellow-500/30 bg-yellow-500/10 px-4 py-2 font-mono text-[11px] uppercase tracking-wider text-yellow-400">
@@ -1385,7 +1141,7 @@ function Index() {
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <h2 className="font-medium">Circuit map &amp; speed trace</h2>
-                {selectedLapId && (
+                {effectiveLapId && (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -1411,13 +1167,13 @@ function Index() {
                   </span>
                 ) : (
                   <span className="rounded-full bg-secondary px-3 py-1 text-xs text-muted-foreground">
-                    {smoothFullTrack.length > 0 ? `${smoothFullTrack.length} pts` : "No data"}
+                    {smoothFullTrack.length > 0 ? `${trackWaypoints.length} GPS pts` : "No data"}
                   </span>
                 )}
-                {(selectedLapId || effectiveLapId) && (
+                {effectiveLapId && (
                   <span className="rounded-full bg-accent/20 px-2.5 py-0.5 text-xs text-accent font-mono">
-                    Lap {laps.find((l) => l.lap_id === (selectedLapId ?? effectiveLapId))?.lap_number ?? ""}
-                    {bestLap && (selectedLapId ?? effectiveLapId) === bestLap.lap_id ? " · Best" : ""}
+                    Lap {laps.find((l) => l.lap_id === effectiveLapId)?.lap_number ?? ""}
+                    {bestLap && effectiveLapId === bestLap.lap_id ? " · Best" : ""}
                   </span>
                 )}
               </div>
@@ -1432,10 +1188,8 @@ function Index() {
               {smoothFullTrack.length > 1 ? (
                 <>
                   {/* Road Corridor Outer Border / Curbs (Circuit Outline / Overlay) */}
-                  <polyline
-                    points={smoothFullTrack
-                      .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
-                      .join(" ")}
+                  <path
+                    d={trackPath}
                     fill="none"
                     stroke="rgba(255, 255, 255, 0.09)"
                     strokeWidth="15"
@@ -1444,10 +1198,8 @@ function Index() {
                   />
 
                   {/* Road Asphalt Surface */}
-                  <polyline
-                    points={smoothFullTrack
-                      .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
-                      .join(" ")}
+                  <path
+                    d={trackPath}
                     fill="none"
                     stroke="#141416"
                     strokeWidth="11"
@@ -1458,7 +1210,7 @@ function Index() {
                   {/* Per-segment Coloured Speed Trace */}
                   {activeSpeedTrace.slice(0, -1).map((pt, i) => {
                     const next = activeSpeedTrace[i + 1];
-                    if (!next) return null;
+                    if (!next || next.breakBefore) return null;
                     return (
                       <line
                         key={i}
@@ -1607,11 +1359,11 @@ function Index() {
                   </>
                 ) : isReplaying ? (
                   <>
-                    Speed <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
+                    Speed <b className="text-foreground">{displaySpeed?.toFixed(1) ?? "—"} km/h</b>
                   </>
                 ) : (
                   <>
-                    Peak speed <b className="text-foreground">{displaySpeed.toFixed(1)} km/h</b>
+                    Peak speed <b className="text-foreground">{displaySpeed?.toFixed(1) ?? "—"} km/h</b>
                   </>
                 )}
               </span>
@@ -1836,7 +1588,7 @@ function Index() {
                   {validOnly ? `${visibleLaps.length} valid` : `${laps.length} total`}
                 </span>
               </h2>
-              {selectedLapId && (
+              {effectiveLapId && (
                 <Button
                   size="sm"
                   variant="ghost"
@@ -1888,9 +1640,9 @@ function Index() {
                       </tr>
                     ))
                   : visibleLaps.map((lap) => {
-                      const isValid = isLapValid(lap, laps, telemetry);
+                      const isValid = validLapIds.has(lap.lap_id);
                       const isBest = isValid && bestLap?.lap_id === lap.lap_id;
-                      const isSelected = (selectedLapId ?? effectiveLapId) === lap.lap_id;
+                      const isSelected = effectiveLapId === lap.lap_id;
                       const delta =
                         isValid && bestLap && !isBest && lap.duration_ms > 0
                           ? formatDelta(lap.duration_ms - bestLap.duration_ms)
@@ -1899,9 +1651,7 @@ function Index() {
                         <tr
                           key={lap.lap_id}
                           onClick={() =>
-                            setSelectedLapId((prev) =>
-                              prev === lap.lap_id ? null : lap.lap_id,
-                            )
+                            setSelectedLapId(effectiveLapId === lap.lap_id ? null : lap.lap_id)
                           }
                           className={`cursor-pointer border-t border-border transition-colors hover:bg-secondary/60 ${
                             isSelected
@@ -1919,7 +1669,9 @@ function Index() {
                               L{lap.lap_number}
                               {!isValid && (
                                 <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70 font-normal">
-                                  (incomplete)
+                                  {lap.is_complete === false || lap.is_complete === 0 || lap.duration_ms < 15000
+                                    ? "Incomplete"
+                                    : "Unverified"}
                                 </span>
                               )}
                             </div>
@@ -1965,9 +1717,7 @@ function Index() {
                               className="h-7 text-xs text-muted-foreground hover:text-foreground"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                setSelectedLapId((prev) =>
-                                  prev === lap.lap_id ? null : lap.lap_id,
-                                );
+                                setSelectedLapId(effectiveLapId === lap.lap_id ? null : lap.lap_id);
                               }}
                             >
                               {isSelected ? "Selected" : "View lap"}

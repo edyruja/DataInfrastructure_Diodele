@@ -12,6 +12,7 @@ import {
   extractGpsWaypoints,
   interpolateTrackPosition,
   interpolateTrackSpline,
+  buildReplayTimeline,
 } from "@/lib/telemetry-sessions";
 
 describe("extractGpsWaypoints and interpolateTrackPosition (60 FPS smooth circuit movement)", () => {
@@ -22,7 +23,7 @@ describe("extractGpsWaypoints and interpolateTrackPosition (60 FPS smooth circui
     { lap_id: "l1", lap_number: 1, lap_offset_ms: 500, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
     { lap_id: "l1", lap_number: 1, lap_offset_ms: 750, lat: 46.7800, lon: 23.6100, speed_kmh: 36, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
     // Next GPS fix at t=1000
-    { lap_id: "l1", lap_number: 1, lap_offset_ms: 1000, lat: 46.7810, lon: 23.6110, speed_kmh: 40, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
+    { lap_id: "l1", lap_number: 1, lap_offset_ms: 1000, lat: 46.7801, lon: 23.6101, speed_kmh: 40, bearing: 0, g_lat: 0, g_lon: 0, is_corner_apex: 0 as const },
   ];
 
   it("extracts distinct GPS waypoints without duplicate stationary coordinates", () => {
@@ -32,18 +33,52 @@ describe("extractGpsWaypoints and interpolateTrackPosition (60 FPS smooth circui
     expect(waypoints[1]!.timeMs).toBe(1000);
   });
 
+  it("keeps corrupt jumps and missing GPS out of the trace and the replay position", () => {
+    const point = rawPoints[0]!;
+    const points = [
+      point,
+      { ...point, lap_offset_ms: 50, lat: 46.784 },
+      { ...point, lap_offset_ms: 100, lat: 46.78402 },
+      { ...point, lap_offset_ms: 4000, lat: 46.7841 },
+    ];
+    const waypoints = extractGpsWaypoints(points);
+    expect(waypoints.map((p) => p.breakBefore ?? false)).toEqual([false, true, false, true]);
+    expect(interpolateTrackPosition(waypoints, 25)).toBeNull();
+    expect(interpolateTrackPosition(waypoints, 2000)).toBeNull();
+    expect(interpolateTrackPosition(waypoints, 75)?.lat).toBeCloseTo(46.78401);
+    const projected = projectPoints(waypoints);
+    const smooth = interpolateTrackSpline(projected);
+    expect(smooth.filter((p) => p.breakBefore)).toHaveLength(2);
+  });
+
+  it("builds a session replay from one chronological clock while preserving lap breaks", () => {
+    const point = rawPoints[0]!;
+    const nextLap = { ...point, lap_id: "l2", lap_number: 2 };
+    const points = buildReplayTimeline([
+      { ...point, lap_offset_ms: 950, session_offset_ms: 950 },
+      { ...nextLap, lap_offset_ms: 15, session_offset_ms: 965 },
+      { ...nextLap, lap_offset_ms: 60, session_offset_ms: 1010 },
+    ]);
+    expect(points.map((p) => p.lap_offset_ms)).toEqual([950, 965, 1010]);
+    expect(extractGpsWaypoints(points)[1]?.breakBefore).toBe(true);
+    expect(buildReplayTimeline([
+      { ...point, lap_offset_ms: 950 },
+      { ...nextLap, lap_offset_ms: 15 },
+    ]).map((p) => p.lap_offset_ms)).toEqual([950, 966]);
+  });
+
   it("interpolates continuous 60 FPS trajectory between GPS fixes without pausing or teleporting", () => {
     const waypoints = extractGpsWaypoints(rawPoints);
     // At t = 250ms (where raw points were previously frozen)
     const at250 = interpolateTrackPosition(waypoints, 250);
     expect(at250).not.toBeNull();
-    expect(at250!.lat).toBeCloseTo(46.78025, 5); // Smoothly 25% of the distance!
-    expect(at250!.lon).toBeCloseTo(23.61025, 5);
+    expect(at250!.lat).toBeCloseTo(46.780025, 7); // Smoothly 25% of the distance!
+    expect(at250!.lon).toBeCloseTo(23.610025, 7);
 
     // At t = 500ms
     const at500 = interpolateTrackPosition(waypoints, 500);
-    expect(at500!.lat).toBeCloseTo(46.7805, 5); // Smoothly 50% of the distance!
-    expect(at500!.lon).toBeCloseTo(23.6105, 5);
+    expect(at500!.lat).toBeCloseTo(46.78005, 7); // Smoothly 50% of the distance!
+    expect(at500!.lon).toBeCloseTo(23.61005, 7);
   });
 });
 
@@ -65,8 +100,8 @@ describe("interpolateTelemetryPoint", () => {
       lap_id: "l1",
       lap_number: 1,
       lap_offset_ms: 100,
-      lat: 46.782,
-      lon: 23.612,
+      lat: 46.78002,
+      lon: 23.61002,
       speed_kmh: 60,
       bearing: 0,
       g_lat: 0.3,
@@ -81,8 +116,8 @@ describe("interpolateTelemetryPoint", () => {
     expect(res!.speed_kmh).toBeCloseTo(55, 1);
     expect(res!.g_lat).toBeCloseTo(0.2, 2);
     expect(res!.g_lon).toBeCloseTo(0.05, 2);
-    expect(res!.lat).toBeCloseTo(46.781, 4);
-    expect(res!.lon).toBeCloseTo(23.611, 4);
+    expect(res!.lat).toBeCloseTo(46.78001, 6);
+    expect(res!.lon).toBeCloseTo(23.61001, 6);
     expect(res!.alpha).toBeCloseTo(0.5, 2);
   });
 
@@ -91,6 +126,13 @@ describe("interpolateTelemetryPoint", () => {
     expect(before!.speed_kmh).toBe(50);
     const after = interpolateTelemetryPoint(points, 200);
     expect(after!.speed_kmh).toBe(60);
+  });
+
+  it("does not estimate telemetry inside a missing interval or between laps", () => {
+    const start = points[0]!;
+    const end = points[1]!;
+    expect(interpolateTelemetryPoint([start, { ...end, lap_offset_ms: 3500 }], 1000)).toBeNull();
+    expect(interpolateTelemetryPoint([start, { ...end, lap_id: "l2" }], 50)).toBeNull();
   });
 });
 
@@ -243,6 +285,10 @@ describe("isLapValid and Best Lap Selection", () => {
     expect(isLapValid(sessionLaps[0]!, sessionLaps)).toBe(true);
     expect(isLapValid(sessionLaps[1]!, sessionLaps)).toBe(true);
     expect(isLapValid(sessionLaps[2]!, sessionLaps)).toBe(false);
+  });
+
+  it("excludes a long lap explicitly stopped before crossing the line", () => {
+    expect(isLapValid({ ...sessionLaps[0]!, is_complete: false, is_valid: false })).toBe(false);
   });
 
   it("excludes incomplete laps when finding session best lap, picking L2 instead of L3", () => {
